@@ -123,9 +123,19 @@ pub async fn init(params: &Init<'_>) -> anyhow::Result<MemoryMappings> {
             // during a servicing operation and unify the application of vtl2
             // protections.
             tracing::debug!("Applying VTL2 protections");
-            apply_vtl2_protections(boot_init.tp, boot_init.vtl2_memory)
+            // Check if we're in a kexec scenario by testing if protections are already applied
+            if let Err(e) = apply_vtl2_protections(boot_init.tp, boot_init.vtl2_memory)
                 .instrument(tracing::info_span!("apply_vtl2_protections", CVM_ALLOWED))
-                .await?;
+                .await
+            {
+                // Check if this is an AccessDenied error indicating already-protected pages
+                let error_string = format!("{:?}", e);
+                if error_string.contains("AccessDenied") || error_string.contains("Access denied") {
+                    tracing::debug!("VTL2 protections already applied (likely kexec scenario), skipping");
+                } else {
+                    return Err(e);
+                }
+            }
         } else {
             // Prepare VTL0 memory for mapping.
             let acceptor = acceptor.as_ref().unwrap();
