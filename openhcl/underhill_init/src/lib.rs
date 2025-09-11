@@ -404,8 +404,15 @@ fn load_modules(modules_path: &str) -> anyhow::Result<()> {
         let r =
             unsafe { libc::syscall(libc::SYS_finit_module, file.as_raw_fd(), params.as_ptr(), 0) };
         if r < 0 {
-            return Err(io::Error::last_os_error())
-                .with_context(|| format!("failed to load module {}", module.display()));
+            let err = io::Error::last_os_error();
+            if err.raw_os_error() == Some(libc::EEXIST) {
+                // Already loaded; not an error for our purposes.
+                log::info!("module already loaded: {}", module.display());
+                continue;
+            } else {
+                return Err(err)
+                    .with_context(|| format!("failed to load module {}", module.display()));
+            }
         }
 
         log::info!("load complete for {}", module.display());
@@ -575,14 +582,113 @@ fn do_main() -> anyhow::Result<()> {
         log::info!("registered vfio-pci as driver for nvme");
     }
 
-    // Start loading modules in parallel.
-    let thread = std::thread::spawn(|| {
-        if let Err(err) = load_modules("/lib/modules") {
-            panic!("failed to load modules: {:#}", err);
+    // Choose a modules path. After a kexec, /lib/modules may be empty. The
+    // rootfs build now stages needed modules under /boot/modules so look there
+    // as a fallback. Allow an override via UNDERHILL_MODULES_PATH for
+    // experimentation.
+    fn choose_modules_path() -> Option<&'static str> {
+        if let Ok(p) = std::env::var("UNDERHILL_MODULES_PATH") {
+            if !p.is_empty() {
+                // Leak the string to get a 'static lifetime (only done once at init).
+                let s: &'static str = Box::leak(p.into_boxed_str());
+                return Some(s);
+            }
         }
-    });
-    if std::env::var("OPENHCL_WAIT_FOR_MODULES").as_deref() == Ok("1") {
-        thread.join().unwrap();
+
+        // Helper to test a candidate path: must exist and contain at least one .ko file.
+        fn valid(path: &str) -> bool {
+            let p = Path::new(path);
+            if !p.exists() { return false; }
+            if let Ok(mut rd) = std::fs::read_dir(p) {
+                while let Some(Ok(entry)) = rd.next() {
+                    let ft = match entry.file_type() { Ok(ft) => ft, Err(_) => continue };
+                    if ft.is_file() && entry.path().extension().and_then(|e| e.to_str()) == Some("ko") { return true; }
+                    if ft.is_dir() {
+                        // Shallow scan inside ordering subdirs (e.g. 000,001,999)
+                        if let Ok(mut sub) = std::fs::read_dir(entry.path()) {
+                            while let Some(Ok(se)) = sub.next() {
+                                if se.path().extension().and_then(|e| e.to_str()) == Some("ko") { return true; }
+                            }
+                        }
+                    }
+                }
+            }
+            false
+        }
+
+        for candidate in ["/lib/modules", "/boot/modules"] { if valid(candidate) { return Some(candidate); } }
+        None
+    }
+
+    if let Some(modules_path) = choose_modules_path() {
+        log::info!("kernel modules path selected: {}", modules_path);
+
+        // Load critical modules synchronously first to avoid races with early
+        // storage / PCI enumeration: pci-hyperv-intf, pci-hyperv, hv_storvsc.
+        // These may be prefixed with ordering numbers (e.g. 000-). Match by
+        // suffix of the stem.
+        let critical = ["pci_hyperv_intf", "pci_hyperv", "hv_storvsc"]; // filenames have '-' replaced with '_' already in param map logic
+        for crit in critical { 
+            // Walk the directory tree looking for a module whose (sanitized) stem ends with crit.
+            let mut found = false;
+            for entry in WalkDir::new(modules_path).into_iter().filter_map(|e| e.ok()) {
+                if !entry.file_type().is_file() { continue; }
+                if entry.path().extension().and_then(|e| e.to_str()) != Some("ko") { continue; }
+                let stem = entry.path().file_stem().and_then(|s| s.to_str()).unwrap_or("").replace('-', "_");
+                if stem.ends_with(crit) { 
+                    log::info!("preloading critical module {} from {}", crit, entry.path().display());
+                    // Reuse loader for a single-module directory by creating a temp dir approach would be overkill; instead inline a tiny loader.
+                    // Build params map (duplicated from load_modules; small and acceptable).
+                    let cmdline = fs_err::read_to_string("/proc/cmdline").unwrap_or_default();
+                    let mut params = HashMap::new();
+                    for option in cmdline.split_ascii_whitespace() { if let Some((module, option)) = option.split_once('.') { if option.contains('=') { let v: &mut String = params.entry(module.replace('-', "_")).or_default(); *v += option; *v += " "; } } }
+                    let module_name = stem.clone();
+                    let mut p = params.get_mut(&module_name);
+                    let file = match fs_err::File::open(entry.path()) { Ok(f)=>f, Err(e)=> { log::error!("failed to open critical module {}: {:#}", entry.path().display(), e); continue; } };
+                    if let Some(params) = p.as_mut() { params.pop(); params.push('\0'); } 
+                    let params_bytes: &[u8] = p.as_ref().map(|s| s.as_bytes()).unwrap_or(b"\0");
+                    let r = unsafe { libc::syscall(libc::SYS_finit_module, file.as_raw_fd(), params_bytes.as_ptr(), 0) };
+                    if r < 0 { let err = io::Error::last_os_error(); if err.raw_os_error() == Some(libc::EEXIST) { log::info!("critical module already loaded: {}", entry.path().display()); } else { log::error!("failed to load critical module {}: {:#}", entry.path().display(), err); } }
+                    found = true; break; 
+                }
+            }
+            if !found { log::warn!("critical module {} not found under {}", crit, modules_path); }
+        }
+
+        // If the selected path is /boot/modules, replicate its contents into
+        // a canonical /lib/modules directory so that any tooling expecting the
+        // conventional location (future additions) can find them. This also
+        // allows us to safely remove the staging directory after load.
+        if modules_path == "/boot/modules" {
+            if let Err(e) = (|| {
+                if !Path::new("/lib/modules").exists() {
+                    fs_err::create_dir_all("/lib/modules")?;
+                }
+                for entry in fs_err::read_dir("/boot/modules")? {
+                    let entry = entry?;
+                    if entry.file_type()?.is_file() {
+                        let dst = format!("/lib/modules/{}", entry.file_name().to_string_lossy());
+                        fs_err::copy(entry.path(), &dst)?;
+                    }
+                }
+                Ok::<_, anyhow::Error>(())
+            })() {
+                log::warn!("failed to mirror /boot/modules to /lib/modules: {:#}", e);
+            }
+        }
+
+        let path_for_thread = modules_path.to_string();
+        // Start loading remaining modules in parallel (will ignore EEXIST for already loaded critical ones).
+        let thread = std::thread::spawn(move || {
+            if let Err(err) = load_modules(&path_for_thread) {
+                panic!("failed to load modules: {:#}", err);
+            }
+        });
+        if std::env::var("OPENHCL_WAIT_FOR_MODULES").as_deref() == Ok("1") {
+            thread.join().unwrap();
+        }
+    } else {
+        log::warn!("no kernel modules directory found (looked in /lib/modules, /boot/modules) – continuing without module loads");
     }
 
     run(&options, new_env)
