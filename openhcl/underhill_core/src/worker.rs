@@ -1310,6 +1310,10 @@ async fn new_underhill_vm(
 
     let boot_info = runtime_params.parsed_openhcl_boot();
 
+    let force_servicing = std::env::var("OPENHCL_FORCE_SERVICING")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+
     // The amount of memory required by the GET igvm_attest request
     let attestation = get_protocol::IGVM_ATTEST_MSG_MAX_SHARED_GPA as u64 * hvdef::HV_PAGE_SIZE;
 
@@ -1784,7 +1788,13 @@ async fn new_underhill_vm(
 
     // Read measured config from VTL0 memory. When restoring, it is already gone.
     let (firmware_type, measured_vtl0_info, load_kind) = {
-        if let Some(firmware_type) = servicing_state.firmware_type {
+        if force_servicing {
+            tracing::warn!(
+                CVM_ALLOWED,
+                "OPENHCL_FORCE_SERVICING set; skipping measured firmware load and treating boot as servicing"
+            );
+            (FirmwareType::None, None, LoadKind::None)
+        } else if let Some(firmware_type) = servicing_state.firmware_type {
             (firmware_type.into(), None, LoadKind::None)
         } else {
             let config = MeasuredVtl0Info::read_from_memory(gm.vtl0())

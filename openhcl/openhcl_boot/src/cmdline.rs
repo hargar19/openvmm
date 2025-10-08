@@ -39,7 +39,7 @@ impl BootCommandLineOptions {
         BootCommandLineOptions {
             confidential_debug: false,
             enable_vtl2_gpa_pool: None,
-            sidecar: true, // sidecar is enabled by default
+            sidecar: false, // sidecar is disabled by default
             sidecar_logging: false,
         }
     }

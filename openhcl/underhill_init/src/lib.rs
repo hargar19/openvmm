@@ -598,16 +598,27 @@ fn do_main() -> anyhow::Result<()> {
         // Helper to test a candidate path: must exist and contain at least one .ko file.
         fn valid(path: &str) -> bool {
             let p = Path::new(path);
-            if !p.exists() { return false; }
+            if !p.exists() {
+                return false;
+            }
             if let Ok(mut rd) = std::fs::read_dir(p) {
                 while let Some(Ok(entry)) = rd.next() {
-                    let ft = match entry.file_type() { Ok(ft) => ft, Err(_) => continue };
-                    if ft.is_file() && entry.path().extension().and_then(|e| e.to_str()) == Some("ko") { return true; }
+                    let ft = match entry.file_type() {
+                        Ok(ft) => ft,
+                        Err(_) => continue,
+                    };
+                    if ft.is_file()
+                        && entry.path().extension().and_then(|e| e.to_str()) == Some("ko")
+                    {
+                        return true;
+                    }
                     if ft.is_dir() {
                         // Shallow scan inside ordering subdirs (e.g. 000,001,999)
                         if let Ok(mut sub) = std::fs::read_dir(entry.path()) {
                             while let Some(Ok(se)) = sub.next() {
-                                if se.path().extension().and_then(|e| e.to_str()) == Some("ko") { return true; }
+                                if se.path().extension().and_then(|e| e.to_str()) == Some("ko") {
+                                    return true;
+                                }
                             }
                         }
                     }
@@ -616,7 +627,11 @@ fn do_main() -> anyhow::Result<()> {
             false
         }
 
-        for candidate in ["/lib/modules", "/boot/modules"] { if valid(candidate) { return Some(candidate); } }
+        for candidate in ["/lib/modules", "/boot/modules"] {
+            if valid(candidate) {
+                return Some(candidate);
+            }
+        }
         None
     }
 
@@ -628,31 +643,93 @@ fn do_main() -> anyhow::Result<()> {
         // These may be prefixed with ordering numbers (e.g. 000-). Match by
         // suffix of the stem.
         let critical = ["pci_hyperv_intf", "pci_hyperv", "hv_storvsc"]; // filenames have '-' replaced with '_' already in param map logic
-        for crit in critical { 
+        for crit in critical {
             // Walk the directory tree looking for a module whose (sanitized) stem ends with crit.
             let mut found = false;
-            for entry in WalkDir::new(modules_path).into_iter().filter_map(|e| e.ok()) {
-                if !entry.file_type().is_file() { continue; }
-                if entry.path().extension().and_then(|e| e.to_str()) != Some("ko") { continue; }
-                let stem = entry.path().file_stem().and_then(|s| s.to_str()).unwrap_or("").replace('-', "_");
-                if stem.ends_with(crit) { 
-                    log::info!("preloading critical module {} from {}", crit, entry.path().display());
+            for entry in WalkDir::new(modules_path)
+                .into_iter()
+                .filter_map(|e| e.ok())
+            {
+                if !entry.file_type().is_file() {
+                    continue;
+                }
+                if entry.path().extension().and_then(|e| e.to_str()) != Some("ko") {
+                    continue;
+                }
+                let stem = entry
+                    .path()
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("")
+                    .replace('-', "_");
+                if stem.ends_with(crit) {
+                    log::info!(
+                        "preloading critical module {} from {}",
+                        crit,
+                        entry.path().display()
+                    );
                     // Reuse loader for a single-module directory by creating a temp dir approach would be overkill; instead inline a tiny loader.
                     // Build params map (duplicated from load_modules; small and acceptable).
                     let cmdline = fs_err::read_to_string("/proc/cmdline").unwrap_or_default();
                     let mut params = HashMap::new();
-                    for option in cmdline.split_ascii_whitespace() { if let Some((module, option)) = option.split_once('.') { if option.contains('=') { let v: &mut String = params.entry(module.replace('-', "_")).or_default(); *v += option; *v += " "; } } }
+                    for option in cmdline.split_ascii_whitespace() {
+                        if let Some((module, option)) = option.split_once('.') {
+                            if option.contains('=') {
+                                let v: &mut String =
+                                    params.entry(module.replace('-', "_")).or_default();
+                                *v += option;
+                                *v += " ";
+                            }
+                        }
+                    }
                     let module_name = stem.clone();
                     let mut p = params.get_mut(&module_name);
-                    let file = match fs_err::File::open(entry.path()) { Ok(f)=>f, Err(e)=> { log::error!("failed to open critical module {}: {:#}", entry.path().display(), e); continue; } };
-                    if let Some(params) = p.as_mut() { params.pop(); params.push('\0'); } 
+                    let file = match fs_err::File::open(entry.path()) {
+                        Ok(f) => f,
+                        Err(e) => {
+                            log::error!(
+                                "failed to open critical module {}: {:#}",
+                                entry.path().display(),
+                                e
+                            );
+                            continue;
+                        }
+                    };
+                    if let Some(params) = p.as_mut() {
+                        params.pop();
+                        params.push('\0');
+                    }
                     let params_bytes: &[u8] = p.as_ref().map(|s| s.as_bytes()).unwrap_or(b"\0");
-                    let r = unsafe { libc::syscall(libc::SYS_finit_module, file.as_raw_fd(), params_bytes.as_ptr(), 0) };
-                    if r < 0 { let err = io::Error::last_os_error(); if err.raw_os_error() == Some(libc::EEXIST) { log::info!("critical module already loaded: {}", entry.path().display()); } else { log::error!("failed to load critical module {}: {:#}", entry.path().display(), err); } }
-                    found = true; break; 
+                    let r = unsafe {
+                        libc::syscall(
+                            libc::SYS_finit_module,
+                            file.as_raw_fd(),
+                            params_bytes.as_ptr(),
+                            0,
+                        )
+                    };
+                    if r < 0 {
+                        let err = io::Error::last_os_error();
+                        if err.raw_os_error() == Some(libc::EEXIST) {
+                            log::info!(
+                                "critical module already loaded: {}",
+                                entry.path().display()
+                            );
+                        } else {
+                            log::error!(
+                                "failed to load critical module {}: {:#}",
+                                entry.path().display(),
+                                err
+                            );
+                        }
+                    }
+                    found = true;
+                    break;
                 }
             }
-            if !found { log::warn!("critical module {} not found under {}", crit, modules_path); }
+            if !found {
+                log::warn!("critical module {} not found under {}", crit, modules_path);
+            }
         }
 
         // If the selected path is /boot/modules, replicate its contents into
@@ -688,7 +765,9 @@ fn do_main() -> anyhow::Result<()> {
             thread.join().unwrap();
         }
     } else {
-        log::warn!("no kernel modules directory found (looked in /lib/modules, /boot/modules) – continuing without module loads");
+        log::warn!(
+            "no kernel modules directory found (looked in /lib/modules, /boot/modules) – continuing without module loads"
+        );
     }
 
     run(&options, new_env)

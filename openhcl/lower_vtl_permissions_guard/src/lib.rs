@@ -35,6 +35,17 @@ impl PagesAccessibleToLowerVtl {
         vtl_protect: Arc<dyn VtlMemoryProtection + Send + Sync>,
         pages: &[u64],
     ) -> Result<Self> {
+        // If skipping VTL protection changes (kexec scenario), do nothing and
+        // return an empty guard that will also no-op on Drop.
+        let skip = std::env::var("OPENHCL_SKIP_VTL_PROTECT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if skip {
+            return Ok(Self {
+                vtl_protect,
+                pages: Vec::new(),
+            });
+        }
         for pfn in pages {
             vtl_protect
                 .modify_vtl_page_setting(*pfn, hvdef::HV_MAP_GPA_PERMISSIONS_ALL)
@@ -49,6 +60,15 @@ impl PagesAccessibleToLowerVtl {
 
 impl Drop for PagesAccessibleToLowerVtl {
     fn drop(&mut self) {
+        // Skip restoration entirely if user requested skipping protection
+        // transitions (kexec debug scenario). Intentionally leaves any pages
+        // in their elevated state – do NOT use outside controlled debugging.
+        let skip = std::env::var("OPENHCL_SKIP_VTL_PROTECT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
+        if skip {
+            return;
+        }
         if let Err(err) = self
             .pages
             .iter()
@@ -59,14 +79,25 @@ impl Drop for PagesAccessibleToLowerVtl {
             })
             .collect::<Result<Vec<_>>>()
         {
-            // The inability to rollback any pages is fatal. We cannot leave the
-            // pages in the state where the correct VTL protections are not
-            // applied, because that would compromise the security of the
-            // platform.
-            panic!(
-                "failed to reset page protections {}",
-                err.as_ref() as &dyn std::error::Error
-            );
+            // Normally the inability to rollback any pages is fatal because
+            // leaving elevated permissions compromises the platform. For
+            // kexec debugging scenarios we allow opting-out via the
+            // OPENHCL_IGNORE_VTL_PROTECT_RESET=1 environment variable so we
+            // can progress further and uncover subsequent failures.
+            let ignore = std::env::var("OPENHCL_IGNORE_VTL_PROTECT_RESET")
+                .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                .unwrap_or(false);
+            if ignore {
+                eprintln!(
+                    "[lower_vtl_permissions_guard] WARN ignoring failed to reset page protections: {}",
+                    err
+                );
+            } else {
+                panic!(
+                    "failed to reset page protections {}",
+                    err.as_ref() as &dyn std::error::Error
+                );
+            }
         }
     }
 }

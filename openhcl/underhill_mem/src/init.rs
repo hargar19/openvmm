@@ -131,7 +131,9 @@ pub async fn init(params: &Init<'_>) -> anyhow::Result<MemoryMappings> {
                 // Check if this is an AccessDenied error indicating already-protected pages
                 let error_string = format!("{:?}", e);
                 if error_string.contains("AccessDenied") || error_string.contains("Access denied") {
-                    tracing::debug!("VTL2 protections already applied (likely kexec scenario), skipping");
+                    tracing::debug!(
+                        "VTL2 protections already applied (likely kexec scenario), skipping"
+                    );
                 } else {
                     return Err(e);
                 }
