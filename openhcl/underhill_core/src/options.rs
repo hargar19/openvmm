@@ -190,6 +190,9 @@ pub struct Options {
 
     /// (OPENHCL_ENABLE_VPCI_RELAY=1) Enable the VPCI relay.
     pub enable_vpci_relay: Option<bool>,
+    /// (OPENHCL_KEXEC_SERVICING=1) Treat this boot as a kexec servicing-style
+    /// restart and skip loading VTL0 firmware (no host-provided state restore).
+    pub kexec_servicing: bool,
 }
 
 impl Options {
@@ -328,6 +331,7 @@ impl Options {
         let enable_vpci_relay = parse_env_bool_opt("OPENHCL_ENABLE_VPCI_RELAY")
             .ok()
             .flatten();
+        let kexec_servicing = parse_legacy_env_bool("OPENHCL_KEXEC_SERVICING");
 
         let mut args = std::env::args().chain(extra_args);
         // Skip our own filename.
@@ -388,6 +392,7 @@ impl Options {
             guest_state_encryption_policy,
             attempt_ak_cert_callback,
             enable_vpci_relay,
+            kexec_servicing,
         })
     }
 

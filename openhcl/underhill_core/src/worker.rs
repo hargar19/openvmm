@@ -298,6 +298,8 @@ pub struct UnderhillEnvCfg {
     pub attempt_ak_cert_callback: Option<bool>,
     /// Enable the VPCI relay
     pub enable_vpci_relay: Option<bool>,
+    /// Treat this boot as kexec servicing (skip VTL0 firmware load)
+    pub kexec_servicing: bool,
 }
 
 /// Bundle of config + runtime objects for hooking into the underhill remote
@@ -1786,6 +1788,9 @@ async fn new_underhill_vm(
     let (firmware_type, measured_vtl0_info, load_kind) = {
         if let Some(firmware_type) = servicing_state.firmware_type {
             (firmware_type.into(), None, LoadKind::None)
+        } else if env_cfg.kexec_servicing {
+            tracing::info!(CVM_ALLOWED, "kexec servicing: skipping VTL0 firmware load");
+            (FirmwareType::None, None, LoadKind::None)
         } else {
             let config = MeasuredVtl0Info::read_from_memory(gm.vtl0())
                 .context("failed to read measured vtl0 info")?;
@@ -1795,6 +1800,7 @@ async fn new_underhill_vm(
                     "pcat" => LoadKind::Pcat,
                     "uefi" => LoadKind::Uefi,
                     "linux" => LoadKind::Linux,
+                    "none" => LoadKind::None,
                     _ => anyhow::bail!("unexpected force load vtl0 type {kind}"),
                 }
             } else {
@@ -1804,7 +1810,6 @@ async fn new_underhill_vm(
                     LoadKind::Uefi
                 }
             };
-
             let firmware_type: FirmwareType = load_kind.into();
             (firmware_type, Some(config), load_kind)
         }

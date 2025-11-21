@@ -186,7 +186,33 @@ impl BackingPrivate for HypervisorBackedX86 {
         // The hypervisor initializes startup suspend to false. Set it to the
         // architectural default.
         if !this.vp_index().is_bsp() {
-            this.backing.deferred_init = true;
+            let kexec_servicing = std::env::var("OPENHCL_KEXEC_SERVICING")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
+                .unwrap_or(false);
+            if kexec_servicing {
+                // Emulate cold-boot AP startup suspend without sending an INIT IPI.
+                // The servicing restart leaves VPs runnable; setting the internal
+                // activity register puts them back into the expected startup suspend
+                // state so sidecar/kernel logic that checks for this does not warn.
+                match this.set_vtl0_startup_suspend(true) {
+                    Ok(()) => {
+                        tracing::info!(
+                            vp = this.vp_index().index(),
+                            "kexec servicing: set startup_suspend directly (no deferred INIT)"
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            vp = this.vp_index().index(),
+                            error = &e as &dyn std::error::Error,
+                            "kexec servicing: failed to set startup_suspend; falling back to deferred INIT"
+                        );
+                        this.backing.deferred_init = true;
+                    }
+                }
+            } else {
+                this.backing.deferred_init = true;
+            }
         }
     }
 
@@ -204,21 +230,39 @@ impl BackingPrivate for HypervisorBackedX86 {
     }
 
     fn pre_run_vp(this: &mut UhProcessor<'_, Self>) {
-        if std::mem::take(&mut this.backing.deferred_init) {
-            tracelimit::info_ratelimited!(
-                vp = this.vp_index().index(),
-                "sending deferred INIT to set startup suspend"
-            );
-            this.partition.request_msi(
-                GuestVtl::Vtl0,
-                virt::irqcon::MsiRequest::new_x86(
-                    virt::irqcon::DeliveryMode::INIT,
-                    this.inner.vp_info.apic_id,
-                    false,
-                    0,
-                    true,
-                ),
-            );
+        let should_send = std::mem::take(&mut this.backing.deferred_init);
+        if should_send {
+            // During a kexec servicing restart, the VP has already run once and
+            // the guest sidecar/kernel may have progressed CPU state beyond the
+            // initial startup suspend expectation. Re-sending the INIT causes
+            // warnings ("unexpected cpu status") and is unnecessary. Skip it
+            // when OPENHCL_KEXEC_SERVICING is set.
+            let kexec_servicing = std::env::var("OPENHCL_KEXEC_SERVICING")
+                .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
+                .unwrap_or(false);
+            if kexec_servicing {
+                tracing::warn!(
+                    vp = this.vp_index().index(),
+                    kexec_servicing,
+                    "kexec servicing: skipping deferred INIT in pre_run_vp"
+                );
+            } else {
+                tracing::debug!(vp = this.vp_index().index(), kexec_servicing, "sending deferred INIT (servicing disabled)");
+                tracelimit::info_ratelimited!(
+                    vp = this.vp_index().index(),
+                    "sending deferred INIT to set startup suspend"
+                );
+                this.partition.request_msi(
+                    GuestVtl::Vtl0,
+                    virt::irqcon::MsiRequest::new_x86(
+                        virt::irqcon::DeliveryMode::INIT,
+                        this.inner.vp_info.apic_id,
+                        false,
+                        0,
+                        true,
+                    ),
+                );
+            }
         }
     }
 

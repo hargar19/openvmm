@@ -331,6 +331,7 @@ async fn launch_workers(
         guest_state_encryption_policy: opt.guest_state_encryption_policy,
         attempt_ak_cert_callback: opt.attempt_ak_cert_callback,
         enable_vpci_relay: opt.enable_vpci_relay,
+        kexec_servicing: opt.kexec_servicing,
     };
 
     let (mut remote_console_cfg, framebuffer_access) =

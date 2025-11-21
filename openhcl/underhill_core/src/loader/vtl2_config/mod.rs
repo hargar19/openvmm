@@ -319,7 +319,26 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
 
     drop(mapping);
 
-    assert_eq!(measured_config.magic, ParavisorMeasuredVtl2Config::MAGIC);
+    // In a kexec servicing scenario, the paravisor measured VTL2 config page may
+    // not have been rewritten by firmware/bootshim on the second boot. That
+    // leaves the magic as 0 instead of the expected "OHCLVTL2". Permit this
+    // when the kexec servicing env var is set; otherwise retain the strict
+    // assertion to catch genuine corruption.
+    let kexec_servicing = std::env::var("OPENHCL_KEXEC_SERVICING")
+        .map(|v| matches!(v.as_str(), "1" | "true" | "TRUE"))
+        .unwrap_or(false);
+    if kexec_servicing {
+        if measured_config.magic != ParavisorMeasuredVtl2Config::MAGIC {
+            tracing::warn!(
+                CVM_ALLOWED,
+                magic = measured_config.magic,
+                expected = ParavisorMeasuredVtl2Config::MAGIC,
+                "kexec servicing: skipping measured vtl2 config magic assertion"
+            );
+        }
+    } else {
+        assert_eq!(measured_config.magic, ParavisorMeasuredVtl2Config::MAGIC);
+    }
 
     let vtom_offset_bit = if measured_config.vtom_offset_bit == 0 {
         None
