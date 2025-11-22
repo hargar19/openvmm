@@ -2035,7 +2035,7 @@ async fn new_underhill_vm(
             )
             .context("unable to write persisted info for next servicing boot")?;
 
-            let load_kind = if let Some(kind) = env_cfg.force_load_vtl0_image {
+            let desired_load_kind = if let Some(kind) = env_cfg.force_load_vtl0_image {
                 tracing::info!(CVM_ALLOWED, kind, "overriding dps load type");
                 match kind.as_str() {
                     "pcat" => LoadKind::Pcat,
@@ -2043,16 +2043,32 @@ async fn new_underhill_vm(
                     "linux" => LoadKind::Linux,
                     _ => anyhow::bail!("unexpected force load vtl0 type {kind}"),
                 }
+            } else if dps.general.firmware_mode_is_pcat {
+                LoadKind::Pcat
             } else {
-                if dps.general.firmware_mode_is_pcat {
-                    LoadKind::Pcat
-                } else {
-                    LoadKind::Uefi
+                LoadKind::Uefi
+            };
+
+            let load_kind = if crate::loader::vtl2_config::is_kexec_servicing_enabled() {
+                if !matches!(desired_load_kind, LoadKind::None) {
+                    tracing::info!(
+                        CVM_ALLOWED,
+                        "servicing reboot detected, skipping VTL0 firmware reload"
+                    );
                 }
+                LoadKind::None
+            } else {
+                desired_load_kind
             };
 
             let firmware_type: FirmwareType = load_kind.into();
-            (firmware_type, Some(config), load_kind)
+            let measured_vtl0_info = if matches!(load_kind, LoadKind::None) {
+                None
+            } else {
+                Some(config)
+            };
+
+            (firmware_type, measured_vtl0_info, load_kind)
         }
     };
 
