@@ -273,6 +273,77 @@ pub mod save_restore {
     use alloc::vec::Vec;
     use memory_range::MemoryRange;
 
+    /// Persisted subset of the paravisor measured VTL2 config needed across
+    /// servicing reboots.
+    #[derive(mesh_protobuf::Protobuf, Clone, Debug, PartialEq)]
+    #[mesh(package = "openhcl.openhcl_boot")]
+    pub struct MeasuredVtl2ConfigState {
+        /// The magic value written by the loader.
+        #[mesh(1)]
+        pub magic: u64,
+        /// The vTOM offset bit reported by the loader.
+        #[mesh(2)]
+        pub vtom_offset_bit: u32,
+    }
+
+    /// Persisted subset of the measured VTL0 config needed across servicing
+    /// reboots.
+    #[derive(mesh_protobuf::Protobuf, Clone, Debug, PartialEq)]
+    #[mesh(package = "openhcl.openhcl_boot")]
+    pub struct MeasuredVtl0ConfigState {
+        /// Indicates whether PCAT firmware is supported.
+        #[mesh(1)]
+        pub supports_pcat: bool,
+        /// Persisted UEFI-specific configuration, if available.
+        #[mesh(2)]
+        pub supports_uefi: Option<MeasuredVtl0UefiState>,
+        /// Persisted Linux-specific configuration, if available.
+        #[mesh(3)]
+        pub supports_linux: Option<MeasuredVtl0LinuxState>,
+    }
+
+    /// Persisted UEFI configuration captured from measured VTL0 config.
+    #[derive(mesh_protobuf::Protobuf, Clone, Debug, PartialEq)]
+    #[mesh(package = "openhcl.openhcl_boot")]
+    pub struct MeasuredVtl0UefiState {
+        /// The firmware image memory range.
+        #[mesh(1)]
+        pub firmware_memory: MemoryRange,
+        /// The raw VP context page captured from measured config, if present.
+        #[mesh(2)]
+        pub vp_context_page: Option<Vec<u8>>,
+    }
+
+    /// Persisted Linux configuration captured from measured VTL0 config.
+    #[derive(mesh_protobuf::Protobuf, Clone, Debug, PartialEq)]
+    #[mesh(package = "openhcl.openhcl_boot")]
+    pub struct MeasuredVtl0LinuxState {
+        /// The memory range containing the Linux kernel image.
+        #[mesh(1)]
+        pub kernel_range: MemoryRange,
+        /// The kernel entry point address.
+        #[mesh(2)]
+        pub kernel_entrypoint: u64,
+        /// The initrd range, if present.
+        #[mesh(3)]
+        pub initrd: Option<MeasuredVtl0LinuxInitrd>,
+        /// The kernel command line (without trailing NUL), if present.
+        #[mesh(4)]
+        pub command_line: Option<Vec<u8>>,
+    }
+
+    /// Persisted Linux initrd description.
+    #[derive(mesh_protobuf::Protobuf, Clone, Debug, PartialEq)]
+    #[mesh(package = "openhcl.openhcl_boot")]
+    pub struct MeasuredVtl0LinuxInitrd {
+        /// The initrd base physical address.
+        #[mesh(1)]
+        pub base: u64,
+        /// The initrd length in bytes.
+        #[mesh(2)]
+        pub len: u64,
+    }
+
     /// A local newtype wrapper that represents a [`igvm_defs::MemoryMapEntryType`].
     ///
     /// This is required to make it protobuf deriveable.
@@ -294,7 +365,7 @@ pub mod save_restore {
 
     /// A memory entry describing what range of address space described as memory is
     /// used for what.
-    #[derive(mesh_protobuf::Protobuf, Debug)]
+    #[derive(mesh_protobuf::Protobuf, Clone, Debug, PartialEq)]
     #[mesh(package = "openhcl.openhcl_boot")]
     pub struct MemoryEntry {
         /// The range of memory.
@@ -313,7 +384,7 @@ pub mod save_restore {
 
     /// A mmio entry describing what range of address space described as mmio is
     /// used for what.
-    #[derive(mesh_protobuf::Protobuf, Debug)]
+    #[derive(mesh_protobuf::Protobuf, Clone, Debug, PartialEq)]
     #[mesh(package = "openhcl.openhcl_boot")]
     pub struct MmioEntry {
         /// The range of mmio.
@@ -326,7 +397,7 @@ pub mod save_restore {
 
     /// The format for saved state between the previous instance of OpenHCL and the
     /// next.
-    #[derive(mesh_protobuf::Protobuf, Debug)]
+    #[derive(mesh_protobuf::Protobuf, Clone, Debug, PartialEq)]
     #[mesh(package = "openhcl.openhcl_boot")]
     pub struct SavedState {
         /// The memory entries describing memory for the whole partition.
@@ -335,5 +406,13 @@ pub mod save_restore {
         /// The mmio entries describing mmio for the whole partition.
         #[mesh(2)]
         pub partition_mmio: Vec<MmioEntry>,
+        /// The measured VTL2 config captured before the previous reboot, if
+        /// available.
+        #[mesh(3)]
+        pub measured_vtl2_config: Option<MeasuredVtl2ConfigState>,
+        /// The measured VTL0 config captured before the previous reboot, if
+        /// available.
+        #[mesh(4)]
+        pub measured_vtl0_config: Option<MeasuredVtl0ConfigState>,
     }
 }

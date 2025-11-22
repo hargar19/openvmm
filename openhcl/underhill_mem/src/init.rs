@@ -116,16 +116,24 @@ pub async fn init(params: &Init<'_>) -> anyhow::Result<MemoryMappings> {
 
     if let Some(boot_init) = &params.boot_init {
         if !params.isolation.is_isolated() {
+            let skip_vtl2 = is_kexec_servicing_boot();
             // TODO: VTL 2 protections are applied in the boot shim for isolated
             // VMs. Since non-isolated VMs can undergo servicing and this is an
             // expensive operation, continue to apply protections here for now. In
             // the future, the boot shim should be made aware of when it's booting
             // during a servicing operation and unify the application of vtl2
             // protections.
-            tracing::debug!("Applying VTL2 protections");
-            apply_vtl2_protections(boot_init.tp, boot_init.vtl2_memory)
-                .instrument(tracing::info_span!("apply_vtl2_protections", CVM_ALLOWED))
-                .await?;
+            if skip_vtl2 {
+                tracing::info!(
+                    CVM_ALLOWED,
+                    "Skipping VTL2 protections during servicing reboot"
+                );
+            } else {
+                tracing::debug!("Applying VTL2 protections");
+                apply_vtl2_protections(boot_init.tp, boot_init.vtl2_memory)
+                    .instrument(tracing::info_span!("apply_vtl2_protections", CVM_ALLOWED))
+                    .await?;
+            }
         } else {
             // Prepare VTL0 memory for mapping.
             let acceptor = acceptor.as_ref().unwrap();
@@ -621,6 +629,20 @@ pub async fn init(params: &Init<'_>) -> anyhow::Result<MemoryMappings> {
         }
     };
     Ok(gm)
+}
+
+fn is_kexec_servicing_boot() -> bool {
+    std::env::var("OPENHCL_KEXEC_SERVICING")
+        .map(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
+
+            let lowered = trimmed.to_ascii_lowercase();
+            !matches!(lowered.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
 }
 
 /// Apply VTL2 protections to all VTL2 ram ranges. This marks all VTL2 pages as

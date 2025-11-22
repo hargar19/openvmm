@@ -1992,10 +1992,49 @@ async fn new_underhill_vm(
     // Read measured config from VTL0 memory. When restoring, it is already gone.
     let (firmware_type, measured_vtl0_info, load_kind) = {
         if let Some(firmware_type) = servicing_state.firmware_type {
+            crate::loader::vtl2_config::persist_state(
+                runtime_params.parsed_openhcl_boot(),
+                runtime_params.measured_vtl2_config(),
+                runtime_params
+                    .persisted_saved_state()
+                    .and_then(|state| state.measured_vtl0_config.as_ref()),
+            )
+            .context("unable to write persisted info for next servicing boot")?;
+
             (firmware_type.into(), None, LoadKind::None)
         } else {
-            let config = MeasuredVtl0Info::read_from_memory(gm.vtl0())
-                .context("failed to read measured vtl0 info")?;
+            let config = match MeasuredVtl0Info::read_from_memory(gm.vtl0()) {
+                Ok(cfg) => cfg,
+                Err(crate::loader::vtl0_config::Error::MissingMagic { .. })
+                    if crate::loader::vtl2_config::is_kexec_servicing_enabled() =>
+                {
+                    let persisted_state = runtime_params
+                        .persisted_saved_state()
+                        .and_then(|state| state.measured_vtl0_config.as_ref())
+                        .context(
+                            "persisted measured vtl0 config unavailable during servicing fallback",
+                        )?;
+
+                    tracing::info!(
+                        CVM_ALLOWED,
+                        "measured VTL0 config magic missing, attempting persisted fallback"
+                    );
+
+                    MeasuredVtl0Info::from_persisted(persisted_state)
+                        .context("failed to restore measured vtl0 info from persisted state")?
+                }
+                Err(err) => return Err(err).context("failed to read measured vtl0 info"),
+            };
+
+            let persisted_vtl0_state = config.persisted_state();
+
+            crate::loader::vtl2_config::persist_state(
+                runtime_params.parsed_openhcl_boot(),
+                runtime_params.measured_vtl2_config(),
+                persisted_vtl0_state.as_ref(),
+            )
+            .context("unable to write persisted info for next servicing boot")?;
+
             let load_kind = if let Some(kind) = env_cfg.force_load_vtl0_image {
                 tracing::info!(CVM_ALLOWED, kind, "overriding dps load type");
                 match kind.as_str() {

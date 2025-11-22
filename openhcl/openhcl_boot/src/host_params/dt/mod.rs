@@ -596,6 +596,7 @@ fn topology_from_persisted_state(
     let loader_defs::shim::save_restore::SavedState {
         partition_memory,
         partition_mmio,
+        ..
     } = parsed_protobuf;
 
     // FUTURE: should memory allocation mode should persist in saved state and

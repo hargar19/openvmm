@@ -14,9 +14,13 @@ use guestmem::ranges::PagedRange;
 use hvdef::HV_PAGE_SIZE;
 use igvm::registers::UnsupportedRegister;
 use loader_defs::paravisor::ParavisorMeasuredVtl0Config;
+use loader_defs::shim::save_restore::MeasuredVtl0ConfigState;
+use loader_defs::shim::save_restore::MeasuredVtl0LinuxInitrd;
+use loader_defs::shim::save_restore::MeasuredVtl0LinuxState;
+use loader_defs::shim::save_restore::MeasuredVtl0UefiState;
 use memory_range::MemoryRange;
 use std::ffi::CString;
-use std::io::Read;
+use std::io::{Cursor, Read};
 use thiserror::Error;
 use tracing::instrument;
 use zerocopy::FromZeros;
@@ -33,6 +37,10 @@ pub enum Error {
     UefiFirmwareRegion,
     #[error("linux info did not contain linux kernel region")]
     LinuxKernelRegion,
+    #[error("measured vtl0 config magic mismatch: expected {expected:#x}, got {found:#x}")]
+    MissingMagic { expected: u64, found: u64 },
+    #[error("persisted measured vtl0 command line invalid")]
+    InvalidPersistedCommandLine,
     #[cfg(guest_arch = "x86_64")]
     #[error("unsupported x64 register")]
     UnsupportedRegister(#[source] UnsupportedRegister<igvm::hv_defs::HvX64RegisterName>),
@@ -45,6 +53,7 @@ pub enum Error {
 pub struct UefiInfo {
     pub firmware_memory: MemoryRange,
     pub vp_context: VpContext,
+    pub vp_context_page: Option<Vec<u8>>,
 }
 
 #[derive(Debug)]
@@ -64,6 +73,7 @@ pub struct MeasuredVtl0Info {
     pub supports_pcat: bool,
     pub supports_uefi: Option<UefiInfo>,
     pub supports_linux: Option<LinuxInfo>,
+    persisted_state: Option<MeasuredVtl0ConfigState>,
 }
 
 impl MeasuredVtl0Info {
@@ -81,12 +91,18 @@ impl MeasuredVtl0Info {
         config_pages.push(PV_CONFIG_BASE_PAGE);
 
         // Verify the magic field is set.
-        assert_eq!(measured_config.magic, ParavisorMeasuredVtl0Config::MAGIC);
+        if measured_config.magic != ParavisorMeasuredVtl0Config::MAGIC {
+            return Err(Error::MissingMagic {
+                expected: ParavisorMeasuredVtl0Config::MAGIC,
+                found: measured_config.magic,
+            });
+        }
 
         let supports_pcat = measured_config.supported_vtl0.pcat_supported();
 
         let supports_uefi = if measured_config.supported_vtl0.uefi_supported() {
             let uefi = &measured_config.uefi_info;
+            let mut persisted_vp_context = None;
             let vp_context = match uefi.vtl0_vp_context.pages() {
                 Some((vtl0_vp_context_page_base, vtl0_vp_context_page_count)) => {
                     assert!(vtl0_vp_context_page_base != 0);
@@ -100,7 +116,8 @@ impl MeasuredVtl0Info {
                     .map_err(Error::GuestMemoryAccess)?;
                     config_pages.push(vtl0_vp_context_page_base);
 
-                    parse_vtl0_vp_context(vtl0_vp_context_raw)?
+                    persisted_vp_context = Some(vtl0_vp_context_raw.clone());
+                    parse_vtl0_vp_context(&vtl0_vp_context_raw)?
                 }
                 None => VpContext::Vbs(Vec::new()),
             };
@@ -109,6 +126,7 @@ impl MeasuredVtl0Info {
                 firmware_memory: memory_range_from_page_region(&uefi.firmware)
                     .ok_or(Error::UefiFirmwareRegion)?,
                 vp_context,
+                vp_context_page: persisted_vp_context,
             })
         } else {
             None
@@ -162,10 +180,30 @@ impl MeasuredVtl0Info {
         )
         .map_err(Error::GuestMemoryAccess)?;
 
+        let persisted_state = Some(MeasuredVtl0ConfigState {
+            supports_pcat,
+            supports_uefi: supports_uefi.as_ref().map(|uefi| MeasuredVtl0UefiState {
+                firmware_memory: uefi.firmware_memory,
+                vp_context_page: uefi.vp_context_page.clone(),
+            }),
+            supports_linux: supports_linux.as_ref().map(|linux| MeasuredVtl0LinuxState {
+                kernel_range: linux.kernel_range,
+                kernel_entrypoint: linux.kernel_entrypoint,
+                initrd: linux
+                    .initrd
+                    .map(|(base, len)| MeasuredVtl0LinuxInitrd { base, len }),
+                command_line: linux
+                    .command_line
+                    .as_ref()
+                    .map(|cmd| cmd.as_bytes().to_vec()),
+            }),
+        });
+
         Ok(Self {
             supports_pcat,
             supports_uefi,
             supports_linux,
+            persisted_state,
         })
     }
 
@@ -202,14 +240,69 @@ impl MeasuredVtl0Info {
 
         Ok(())
     }
+
+    /// Return the persisted representation of this measured config, if available.
+    pub fn persisted_state(&self) -> Option<MeasuredVtl0ConfigState> {
+        self.persisted_state.clone()
+    }
+
+    /// Reconstruct measured VTL0 info from persisted servicing state.
+    pub fn from_persisted(state: &MeasuredVtl0ConfigState) -> Result<Self, Error> {
+        let supports_pcat = state.supports_pcat;
+
+        let supports_uefi = if let Some(uefi_state) = &state.supports_uefi {
+            let vp_context_page = uefi_state.vp_context_page.clone();
+            let vp_context = if let Some(page) = &vp_context_page {
+                parse_vtl0_vp_context(page.as_slice())?
+            } else {
+                VpContext::Vbs(Vec::new())
+            };
+
+            Some(UefiInfo {
+                firmware_memory: uefi_state.firmware_memory,
+                vp_context,
+                vp_context_page,
+            })
+        } else {
+            None
+        };
+
+        let supports_linux = if let Some(linux_state) = &state.supports_linux {
+            let command_line = match &linux_state.command_line {
+                Some(bytes) => Some(
+                    CString::new(bytes.clone()).map_err(|_| Error::InvalidPersistedCommandLine)?,
+                ),
+                None => None,
+            };
+
+            Some(LinuxInfo {
+                kernel_range: linux_state.kernel_range,
+                kernel_entrypoint: linux_state.kernel_entrypoint,
+                initrd: linux_state
+                    .initrd
+                    .as_ref()
+                    .map(|initrd| (initrd.base, initrd.len)),
+                command_line,
+            })
+        } else {
+            None
+        };
+
+        Ok(Self {
+            supports_pcat,
+            supports_uefi,
+            supports_linux,
+            persisted_state: Some(state.clone()),
+        })
+    }
 }
 
 /// Parse and validate the raw byte VTL0 VP context into expected format
 /// depending on isolation architecture.
-fn parse_vtl0_vp_context(raw: Vec<u8>) -> Result<VpContext, Error> {
+fn parse_vtl0_vp_context(raw: &[u8]) -> Result<VpContext, Error> {
     // VBS format is a VbsVpContextHeader followed by VbsVpContextRegister.
     let mut header = igvm_defs::VbsVpContextHeader::new_zeroed();
-    let mut reader = std::io::Cursor::new(raw);
+    let mut reader = Cursor::new(raw);
     let mut registers = Vec::new();
     reader
         .read_exact(header.as_mut_bytes())

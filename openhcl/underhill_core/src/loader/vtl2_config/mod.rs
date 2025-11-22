@@ -8,7 +8,7 @@
 //! runtime, unlike measured config. Parameters provided by openhcl_boot are
 //! expected to be already validated by the bootloader.
 
-use anyhow::Context;
+use anyhow::{Context, ensure};
 use bootloader_fdt_parser::IsolationType;
 use bootloader_fdt_parser::ParsedBootDtInfo;
 use cvm_tracing::CVM_ALLOWED;
@@ -23,8 +23,15 @@ use loader_defs::paravisor::PARAVISOR_RESERVED_VTL2_SNP_SECRETS_PAGE_INDEX;
 use loader_defs::paravisor::PARAVISOR_RESERVED_VTL2_SNP_SECRETS_SIZE_PAGES;
 use loader_defs::paravisor::ParavisorMeasuredVtl2Config;
 use loader_defs::shim::MemoryVtlType;
+use loader_defs::shim::PersistedStateHeader;
+use loader_defs::shim::save_restore::MeasuredVtl0ConfigState;
+use loader_defs::shim::save_restore::MeasuredVtl2ConfigState;
+use loader_defs::shim::save_restore::MemoryEntry;
+use loader_defs::shim::save_restore::MmioEntry;
+use loader_defs::shim::save_restore::SavedState;
 use memory_range::MemoryRange;
 use sparse_mmap::SparseMapping;
+use std::convert::TryFrom;
 use string_page_buf::StringBuffer;
 use vm_topology::memory::MemoryRangeWithNode;
 use zerocopy::Immutable;
@@ -43,6 +50,10 @@ pub struct RuntimeParameters {
     #[inspect(iter_by_index)]
     bootshim_logs: Vec<String>,
     bootshim_log_dropped: u16,
+    #[inspect(skip)]
+    persisted_saved_state: Option<SavedState>,
+    #[inspect(skip)]
+    measured_vtl2_config: ParavisorMeasuredVtl2Config,
 }
 
 impl RuntimeParameters {
@@ -83,6 +94,16 @@ impl RuntimeParameters {
     /// The memory ranges to use for the private pool
     pub fn private_pool_ranges(&self) -> &[MemoryRangeWithNode] {
         &self.parsed_openhcl_boot.private_pool_ranges
+    }
+
+    /// The persisted saved state captured before this boot, if available.
+    pub fn persisted_saved_state(&self) -> Option<&SavedState> {
+        self.persisted_saved_state.as_ref()
+    }
+
+    /// The measured VTL2 config captured from bootshim.
+    pub fn measured_vtl2_config(&self) -> &ParavisorMeasuredVtl2Config {
+        &self.measured_vtl2_config
     }
 }
 
@@ -200,13 +221,102 @@ impl Drop for Vtl2ParamsMap<'_> {
     }
 }
 
-// Write persisted info into the bootshim described persisted region.
-fn write_persisted_info(parsed: &ParsedBootDtInfo) -> anyhow::Result<()> {
-    use loader_defs::shim::PersistedStateHeader;
-    use loader_defs::shim::save_restore::MemoryEntry;
-    use loader_defs::shim::save_restore::MmioEntry;
-    use loader_defs::shim::save_restore::SavedState;
+pub(crate) fn is_kexec_servicing_enabled() -> bool {
+    std::env::var("OPENHCL_KEXEC_SERVICING")
+        .map(|value| {
+            let trimmed = value.trim();
+            if trimmed.is_empty() {
+                return false;
+            }
 
+            let lowered = trimmed.to_ascii_lowercase();
+            !matches!(lowered.as_str(), "0" | "false" | "off" | "no")
+        })
+        .unwrap_or(false)
+}
+
+fn load_persisted_saved_state(parsed: &ParsedBootDtInfo) -> anyhow::Result<Option<SavedState>> {
+    let header_range = [parsed.vtl2_persisted_header];
+    let header_mapping =
+        Vtl2ParamsMap::new(&header_range, false).context("failed to map persisted state header")?;
+    let header: PersistedStateHeader = header_mapping
+        .read_plain(0)
+        .context("failed to read persisted state header")?;
+    drop(header_mapping);
+
+    if header.magic != PersistedStateHeader::MAGIC || header.protobuf_payload_len == 0 {
+        return Ok(None);
+    }
+
+    if header.protobuf_base != parsed.vtl2_persisted_protobuf_region.start() {
+        tracing::warn!(
+            CVM_ALLOWED,
+            persisted_base = header.protobuf_base,
+            expected_base = parsed.vtl2_persisted_protobuf_region.start(),
+            "persisted protobuf base mismatch"
+        );
+        return Ok(None);
+    }
+
+    if header.protobuf_region_len > parsed.vtl2_persisted_protobuf_region.len() {
+        tracing::warn!(
+            CVM_ALLOWED,
+            persisted_len = header.protobuf_region_len,
+            region_len = parsed.vtl2_persisted_protobuf_region.len(),
+            "persisted protobuf region length exceeds reserved buffer"
+        );
+        return Ok(None);
+    }
+
+    if header.protobuf_payload_len > header.protobuf_region_len {
+        tracing::warn!(
+            CVM_ALLOWED,
+            payload_len = header.protobuf_payload_len,
+            region_len = header.protobuf_region_len,
+            "persisted protobuf payload length exceeds region length"
+        );
+        return Ok(None);
+    }
+
+    let payload_len = usize::try_from(header.protobuf_payload_len)
+        .context("persisted protobuf payload length does not fit usize")?;
+    if payload_len == 0 {
+        return Ok(None);
+    }
+
+    let region_len = usize::try_from(parsed.vtl2_persisted_protobuf_region.len())
+        .context("persisted protobuf region length does not fit usize")?;
+    if payload_len > region_len {
+        tracing::warn!(
+            CVM_ALLOWED,
+            payload_len,
+            region_len,
+            "persisted protobuf payload longer than mapped region"
+        );
+        return Ok(None);
+    }
+
+    let protobuf_range = [parsed.vtl2_persisted_protobuf_region];
+    let proto_mapping = Vtl2ParamsMap::new(&protobuf_range, false)
+        .context("failed to map persisted protobuf region")?;
+    let mut buf = vec![0u8; payload_len];
+    proto_mapping
+        .read_at(0, buf.as_mut_slice())
+        .context("failed to read persisted state protobuf")?;
+    drop(proto_mapping);
+
+    let saved_state: SavedState =
+        mesh_protobuf::decode(&buf).context("failed to decode persisted state protobuf")?;
+
+    Ok(Some(saved_state))
+}
+
+/// Write persisted info into the bootshim described persisted region.
+pub fn persist_state(
+    parsed: &ParsedBootDtInfo,
+    measured_config: &ParavisorMeasuredVtl2Config,
+    measured_vtl0: Option<&MeasuredVtl0ConfigState>,
+) -> anyhow::Result<()> {
     tracing::trace!(
         protobuf_region = ?parsed.vtl2_persisted_protobuf_region,
         "writing persisted protobuf"
@@ -215,6 +325,16 @@ fn write_persisted_info(parsed: &ParsedBootDtInfo) -> anyhow::Result<()> {
     let ranges = [parsed.vtl2_persisted_protobuf_region];
     let mapping =
         Vtl2ParamsMap::new_writeable(&ranges).context("failed to map persisted protobuf region")?;
+
+    let measured_config_for_persist = if measured_config.magic == ParavisorMeasuredVtl2Config::MAGIC
+    {
+        Some(MeasuredVtl2ConfigState {
+            magic: measured_config.magic,
+            vtom_offset_bit: u32::from(measured_config.vtom_offset_bit),
+        })
+    } else {
+        None
+    };
 
     // Create the serialized data to write.
     let state = SavedState {
@@ -245,6 +365,8 @@ fn write_persisted_info(parsed: &ParsedBootDtInfo) -> anyhow::Result<()> {
                 bootloader_fdt_parser::AddressRange::Memory(_) => None,
             })
             .collect(),
+        measured_vtl2_config: measured_config_for_persist,
+        measured_vtl0_config: measured_vtl0.cloned(),
     };
 
     let protobuf = mesh_protobuf::encode(state);
@@ -400,7 +522,10 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
         Vec::new()
     };
 
-    let measured_config = mapping
+    let persisted_saved_state = load_persisted_saved_state(&parsed_openhcl_boot)
+        .context("failed to load persisted saved state")?;
+
+    let mut measured_config = mapping
         .read_plain::<ParavisorMeasuredVtl2Config>(
             (PARAVISOR_MEASURED_VTL2_CONFIG_PAGE_INDEX * HV_PAGE_SIZE) as usize,
         )
@@ -408,20 +533,65 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
 
     drop(mapping);
 
-    assert_eq!(measured_config.magic, ParavisorMeasuredVtl2Config::MAGIC);
+    if measured_config.magic != ParavisorMeasuredVtl2Config::MAGIC {
+        if is_kexec_servicing_enabled() {
+            tracing::info!(
+                CVM_ALLOWED,
+                "measured VTL2 config magic missing, attempting persisted fallback"
+            );
+
+            match persisted_saved_state
+                .as_ref()
+                .and_then(|state| state.measured_vtl2_config.as_ref())
+            {
+                Some(persisted_config) => {
+                    let vtom_offset_bit = u8::try_from(persisted_config.vtom_offset_bit)
+                        .context("persisted vtom offset bit does not fit in u8")?;
+                    tracing::info!(
+                        CVM_ALLOWED,
+                        vtom_offset_bit,
+                        "restored measured VTL2 config from persisted state"
+                    );
+                    measured_config = ParavisorMeasuredVtl2Config {
+                        magic: persisted_config.magic,
+                        vtom_offset_bit,
+                        padding: [0; 7],
+                    };
+                }
+                None => {
+                    tracing::warn!(
+                        CVM_ALLOWED,
+                        "persisted measured VTL2 config unavailable during kexec servicing boot; proceeding without vTOM offset"
+                    );
+                    measured_config = ParavisorMeasuredVtl2Config {
+                        magic: ParavisorMeasuredVtl2Config::MAGIC,
+                        vtom_offset_bit: 0,
+                        padding: [0; 7],
+                    };
+                }
+            }
+        } else {
+            ensure!(
+                false,
+                "invalid measured vtl2 config magic: expected {:#x}, got {:#x}",
+                ParavisorMeasuredVtl2Config::MAGIC,
+                measured_config.magic
+            );
+        }
+    }
+
+    ensure!(
+        measured_config.magic == ParavisorMeasuredVtl2Config::MAGIC,
+        "invalid measured vtl2 config magic after kexec fallback: expected {:#x}, got {:#x}",
+        ParavisorMeasuredVtl2Config::MAGIC,
+        measured_config.magic
+    );
 
     let vtom_offset_bit = if measured_config.vtom_offset_bit == 0 {
         None
     } else {
         Some(measured_config.vtom_offset_bit)
     };
-
-    // For now, save the persisted info after we read the bootshim provided data
-    // as all information we're persisting is currently known. In the future, if
-    // we plan on putting more usermode specific data such as the full openvmm
-    // saved state, we should probably move this to a servicing specific call.
-    write_persisted_info(&parsed_openhcl_boot)
-        .context("unable to write persisted info for next servicing boot")?;
 
     let runtime_params = RuntimeParameters {
         parsed_openhcl_boot,
@@ -431,6 +601,8 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
         snp_secrets,
         bootshim_logs,
         bootshim_log_dropped,
+        persisted_saved_state,
+        measured_vtl2_config: measured_config,
     };
 
     let measured_vtl2_info = MeasuredVtl2Info {
