@@ -61,11 +61,16 @@ use hvdef::HV_PAGE_SHIFT;
 use hvdef::HV_PAGE_SIZE;
 use hvdef::HV_PAGE_SIZE_USIZE;
 use hvdef::HvError;
+#[cfg(guest_arch = "x86_64")]
+use hvdef::HvInternalActivityRegister;
 use hvdef::HvMapGpaFlags;
 use hvdef::HvPartitionPrivilege;
 use hvdef::HvRegisterName;
+use hvdef::HvRegisterValue;
 use hvdef::HvRegisterVsmPartitionConfig;
 use hvdef::HvRegisterVsmPartitionStatus;
+#[cfg(guest_arch = "x86_64")]
+use hvdef::HvX64RegisterName;
 use hvdef::Vtl;
 use hvdef::hypercall::HV_INTERCEPT_ACCESS_MASK_EXECUTE;
 use hvdef::hypercall::HV_INTERCEPT_ACCESS_MASK_NONE;
@@ -799,6 +804,65 @@ struct ExitActivity {
 
 /// Immutable access to useful bits of Partition state.
 impl UhPartition {
+    /// Returns true if the partition is backed by a running sidecar instance.
+    pub fn has_sidecar(&self) -> bool {
+        self.inner.hcl.sidecar_base_cpu(0).is_some()
+    }
+
+    /// Ensures each VP is quiesced in the same state sidecar would have left
+    /// it in prior to a servicing kexec handoff.
+    pub fn prepare_for_kexec(&self) -> anyhow::Result<()> {
+        #[cfg(guest_arch = "x86_64")]
+        {
+            for vp_index in 0..self.inner.vps.len() {
+                self.prepare_vp_for_kexec(vp_index as u32)?;
+            }
+        }
+
+        #[cfg(not(guest_arch = "x86_64"))]
+        {
+            let _ = self;
+        }
+
+        Ok(())
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn prepare_vp_for_kexec(&self, vp_index: u32) -> anyhow::Result<()> {
+        match self.inner.isolation {
+            IsolationType::None | IsolationType::Vbs => {
+                self.prepare_vp_for_kexec_with::<HypervisorBacked>(vp_index)
+            }
+            IsolationType::Snp => self.prepare_vp_for_kexec_with::<SnpBacked>(vp_index),
+            IsolationType::Tdx => self.prepare_vp_for_kexec_with::<TdxBacked>(vp_index),
+        }
+    }
+
+    #[cfg(guest_arch = "x86_64")]
+    fn prepare_vp_for_kexec_with<T: Backing>(&self, vp_index: u32) -> anyhow::Result<()> {
+        use anyhow::Context as _;
+
+        let mut runner = self
+            .inner
+            .hcl
+            .runner::<T::HclBacking<'_>>(vp_index, false)
+            .map_err(|err| anyhow::anyhow!(err))
+            .context("failed to acquire VP runner for kexec prep")?;
+
+        runner.flush_deferred_state();
+
+        let activity = HvInternalActivityRegister::new().with_startup_suspend(true);
+        runner
+            .set_vp_register(
+                GuestVtl::Vtl0,
+                HvX64RegisterName::InternalActivityState,
+                HvRegisterValue::from(u64::from(activity)),
+            )
+            .context("failed to set internal activity register")?;
+
+        Ok(())
+    }
+
     /// Revokes guest VSM.
     pub fn revoke_guest_vsm(&self) -> Result<(), RevokeGuestVsmError> {
         fn revoke<T: Inspect>(vsm_state: &mut GuestVsmState<T>) -> Result<(), RevokeGuestVsmError> {

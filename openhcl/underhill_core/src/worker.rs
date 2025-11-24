@@ -2146,6 +2146,13 @@ async fn new_underhill_vm(
 
     let partition = Arc::new(partition);
 
+    let kexec_servicing = crate::loader::vtl2_config::is_kexec_servicing_enabled();
+    if kexec_servicing && !partition.has_sidecar() {
+        partition
+            .prepare_for_kexec()
+            .context("failed to prepare partition for servicing kexec without sidecar")?;
+    }
+
     // By default, scale the max QD by the number of VPs to save memory
     // on smaller VMs, up to a QD of 256.
     // Smaller VMs have lower performance targets than larger VMs,
