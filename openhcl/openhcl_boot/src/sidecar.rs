@@ -64,6 +64,7 @@ pub fn start_sidecar<'a>(
     sidecar_params: &'a mut SidecarParams,
     sidecar_output: &'a mut SidecarOutput,
 ) -> Option<SidecarConfig<'a>> {
+    return None;
     if !cfg!(target_arch = "x86_64") || p.isolation_type != IsolationType::None {
         return None;
     }
