@@ -120,6 +120,7 @@ use state_unit::SpawnedUnit;
 use state_unit::StateUnits;
 use std::collections::HashMap;
 use std::ffi::CString;
+use std::env;
 use std::future;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -1389,7 +1390,7 @@ async fn new_underhill_vm(
         control_send,
     } = params;
 
-    if let Ok(kernel_boot_time) = std::env::var("KERNEL_BOOT_TIME") {
+    if let Ok(kernel_boot_time) = env::var("KERNEL_BOOT_TIME") {
         if let Ok(kernel_boot_time_ns) = kernel_boot_time.parse::<u64>() {
             tracing::info!(CVM_ALLOWED, kernel_boot_time_ns, "kernel boot time");
         }
@@ -1993,9 +1994,17 @@ async fn new_underhill_vm(
     };
 
     // Read measured config from VTL0 memory. When restoring, it is already gone.
+    let kexec_servicing = env::var_os("OPENHCL_KEXEC_SERVICING").is_some();
+
     let (firmware_type, measured_vtl0_info, load_kind) = {
         if let Some(firmware_type) = servicing_state.firmware_type {
             (firmware_type.into(), None, LoadKind::None)
+        } else if kexec_servicing {
+            tracing::info!(
+                CVM_ALLOWED,
+                "OPENHCL_KEXEC_SERVICING=1 set; skipping VTL0 measured config read"
+            );
+            (FirmwareType::None, None, LoadKind::None)
         } else {
             let config = MeasuredVtl0Info::read_from_memory(gm.vtl0())
                 .context("failed to read measured vtl0 info")?;
