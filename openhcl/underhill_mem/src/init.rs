@@ -23,6 +23,7 @@ use inspect::Inspect;
 use memory_range::AlignedSubranges;
 use memory_range::MemoryRange;
 use pal_async::task::Spawn;
+use std::env;
 use std::sync::Arc;
 use tracing::Instrument;
 use underhill_threadpool::AffinitizedThreadpool;
@@ -116,16 +117,24 @@ pub async fn init(params: &Init<'_>) -> anyhow::Result<MemoryMappings> {
 
     if let Some(boot_init) = &params.boot_init {
         if !params.isolation.is_isolated() {
+            let servicing_boot = env::var_os("OPENHCL_KEXEC_SERVICING").is_some();
             // TODO: VTL 2 protections are applied in the boot shim for isolated
             // VMs. Since non-isolated VMs can undergo servicing and this is an
             // expensive operation, continue to apply protections here for now. In
             // the future, the boot shim should be made aware of when it's booting
             // during a servicing operation and unify the application of vtl2
             // protections.
-            tracing::debug!("Applying VTL2 protections");
-            apply_vtl2_protections(boot_init.tp, boot_init.vtl2_memory)
-                .instrument(tracing::info_span!("apply_vtl2_protections", CVM_ALLOWED))
-                .await?;
+            if servicing_boot {
+                tracing::info!(
+                    CVM_ALLOWED,
+                    "OPENHCL_KEXEC_SERVICING=1 set; assuming VTL2 protections already applied"
+                );
+            } else {
+                tracing::debug!("Applying VTL2 protections");
+                apply_vtl2_protections(boot_init.tp, boot_init.vtl2_memory)
+                    .instrument(tracing::info_span!("apply_vtl2_protections", CVM_ALLOWED))
+                    .await?;
+            }
         } else {
             // Prepare VTL0 memory for mapping.
             let acceptor = acceptor.as_ref().unwrap();
