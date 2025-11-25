@@ -63,12 +63,20 @@ use hvdef::HV_PAGE_SIZE_USIZE;
 use hvdef::HvError;
 #[cfg(guest_arch = "x86_64")]
 use hvdef::HvInternalActivityRegister;
+#[cfg(guest_arch = "x86_64")]
+use hvdef::HvRegisterVpAssistPage;
 use hvdef::HvMapGpaFlags;
 use hvdef::HvPartitionPrivilege;
 use hvdef::HvRegisterName;
 use hvdef::HvRegisterValue;
 use hvdef::HvRegisterVsmPartitionConfig;
 use hvdef::HvRegisterVsmPartitionStatus;
+#[cfg(guest_arch = "x86_64")]
+use hvdef::HvVpAssistPage;
+#[cfg(guest_arch = "x86_64")]
+use hvdef::HvVpVtlControl;
+#[cfg(guest_arch = "x86_64")]
+use hvdef::HvVtlEntryReason;
 #[cfg(guest_arch = "x86_64")]
 use hvdef::HvX64RegisterName;
 use hvdef::Vtl;
@@ -95,6 +103,8 @@ use processor::BackingSharedParams;
 use processor::SidecarExitReason;
 use sidecar_client::NewSidecarClientError;
 use std::collections::HashMap;
+#[cfg(guest_arch = "x86_64")]
+use std::mem::offset_of;
 use std::ops::RangeInclusive;
 use std::os::fd::AsRawFd;
 use std::sync::Arc;
@@ -859,6 +869,23 @@ impl UhPartition {
                 HvRegisterValue::from(u64::from(activity)),
             )
             .context("failed to set internal activity register")?;
+
+        let assist_page_reg = runner
+            .get_vp_register(GuestVtl::Vtl0, HvX64RegisterName::VpAssistPage)
+            .context("failed to query VP assist page register")?;
+        let assist_page_reg = HvRegisterVpAssistPage::from(assist_page_reg.as_u64());
+        if assist_page_reg.enabled() {
+            let assist_page_gpa = assist_page_reg.gpa_page_number() << HV_PAGE_SHIFT;
+            let entry_reason_offset = (offset_of!(HvVpAssistPage, vtl_control)
+                + offset_of!(HvVpVtlControl, entry_reason)) as u64;
+            self.inner
+                .gm[GuestVtl::Vtl0]
+                .write_plain(
+                    assist_page_gpa + entry_reason_offset,
+                    &HvVtlEntryReason::INTERRUPT,
+                )
+                .context("failed to update VP assist entry reason")?;
+        }
 
         Ok(())
     }
