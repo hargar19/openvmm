@@ -3475,6 +3475,10 @@ async fn new_underhill_vm(
         .validate_restore()
         .context("failed to validate restore for dma manager")?;
 
+    ensure_vtl2_cpus_online(&processor_topology)
+        .await
+        .context("failed to online VTL2 CPUs")?;
+
     // Start the VP tasks on the thread pool.
     crate::vp::spawn_vps(tp, vps, vp_runners, &chipset, isolation)
         .await
@@ -3755,6 +3759,18 @@ async fn wait_for_flush_logs(control_send: &Arc<Mutex<Option<mesh::Sender<Contro
     if let Some(call) = call {
         call.await.ok();
     }
+}
+
+async fn ensure_vtl2_cpus_online(processor_topology: &ProcessorTopology) -> anyhow::Result<()> {
+    for vp in processor_topology.vps() {
+        let cpu = vp.vp_index.index();
+        if !underhill_threadpool::is_cpu_online(cpu)
+            .with_context(|| format!("failed to read online state for cpu {cpu}"))?
+        {
+            crate::vp::online_cpu(cpu).await;
+        }
+    }
+    Ok(())
 }
 
 async fn load_firmware(

@@ -312,7 +312,7 @@ impl VpSpawner {
     }
 }
 
-async fn online_cpu(cpu: u32) {
+pub(crate) async fn online_cpu(cpu: u32) {
     // Spawn a thread to online the processor to avoid blocking this thread
     // (which probably wants to run another VP).
     let (send, recv) = mesh::oneshot();
