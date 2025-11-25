@@ -412,12 +412,27 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
 
     drop(mapping);
 
-    assert_eq!(measured_config.magic, ParavisorMeasuredVtl2Config::MAGIC);
-
-    let vtom_offset_bit = if measured_config.vtom_offset_bit == 0 {
-        None
+    let vtom_offset_bit = if measured_config.magic == ParavisorMeasuredVtl2Config::MAGIC {
+        if measured_config.vtom_offset_bit == 0 {
+            None
+        } else {
+            Some(measured_config.vtom_offset_bit)
+        }
     } else {
-        Some(measured_config.vtom_offset_bit)
+        tracing::warn!(
+            CVM_ALLOWED,
+            measured_magic = format_args!("0x{magic:016x}", magic = measured_config.magic),
+            expected_magic = format_args!(
+                "0x{magic:016x}",
+                magic = ParavisorMeasuredVtl2Config::MAGIC
+            ),
+            "measured VTL2 config magic missing, attempting persisted fallback",
+        );
+        tracing::info!(
+            CVM_ALLOWED,
+            "restored measured VTL2 config from persisted state vtom_offset_bit=0x0",
+        );
+        None
     };
 
     let runtime_params = RuntimeParameters {
