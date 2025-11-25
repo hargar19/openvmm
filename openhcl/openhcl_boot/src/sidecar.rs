@@ -65,6 +65,11 @@ pub fn start_sidecar<'a>(
     sidecar_params: &'a mut SidecarParams,
     sidecar_output: &'a mut SidecarOutput,
 ) -> Option<SidecarConfig<'a>> {
+    if sidecar_globally_disabled() {
+        log!("sidecar: disabled globally");
+        return None;
+    }
+
     if !cfg!(target_arch = "x86_64") || p.isolation_type != IsolationType::None {
         return None;
     }
@@ -222,4 +227,9 @@ pub fn start_sidecar<'a>(
         node_params: &sidecar_params.nodes[..node_count],
         nodes: &nodes[..node_count],
     })
+}
+
+#[inline(always)]
+fn sidecar_globally_disabled() -> bool {
+    true
 }

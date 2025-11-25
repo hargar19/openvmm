@@ -122,7 +122,7 @@ impl BootCommandLineOptions {
         BootCommandLineOptions {
             confidential_debug: false,
             enable_vtl2_gpa_pool: Vtl2GpaPoolConfig::Heuristics(Vtl2GpaPoolLookupTable::Release), // use the release config by default
-            sidecar: SidecarOptions::default(),
+            sidecar: SidecarOptions::DisabledCommandLine,
             disable_nvme_keep_alive: false,
         }
     }
