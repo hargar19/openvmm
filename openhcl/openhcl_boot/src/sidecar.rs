@@ -11,6 +11,9 @@ use crate::host_params::shim_params::ShimParams;
 use crate::memory::AddressSpaceManager;
 use crate::memory::AllocationPolicy;
 use crate::memory::AllocationType;
+use core::convert::TryInto;
+use core::ptr;
+use memory_range::MemoryRange;
 use sidecar_defs::SidecarNodeOutput;
 use sidecar_defs::SidecarNodeParams;
 use sidecar_defs::SidecarOutput;
@@ -183,6 +186,8 @@ pub fn start_sidecar<'a>(
                 }
             };
 
+            zero_sidecar_node_memory(mem.range);
+
             *node = SidecarNodeParams {
                 memory_base: mem.range.start(),
                 memory_size: mem.range.len(),
@@ -222,4 +227,22 @@ pub fn start_sidecar<'a>(
         node_params: &sidecar_params.nodes[..node_count],
         nodes: &nodes[..node_count],
     })
+}
+
+fn zero_sidecar_node_memory(range: MemoryRange) {
+    let len: usize = range
+        .len()
+        .try_into()
+        .expect("sidecar allocation length does not fit usize");
+    let base: usize = range
+        .start()
+        .try_into()
+        .expect("sidecar allocation base does not fit usize");
+
+    // SAFETY: `range` refers to VTL2 RAM exclusively owned by the new sidecar
+    // node. Zeroing it ensures no stale control state survives a servicing
+    // reboot.
+    unsafe {
+        ptr::write_bytes(base as *mut u8, 0, len);
+    }
 }
