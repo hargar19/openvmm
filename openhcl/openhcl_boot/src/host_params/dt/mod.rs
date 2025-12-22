@@ -882,18 +882,29 @@ impl PartitionInfo {
             boot_options,
         } = storage;
 
-        if let (SidecarOptions::Enabled { cpu_threshold, .. }, true) = (
+        if let (
+            SidecarOptions::Enabled {
+                cpu_threshold,
+                kexec_servicing,
+                ..
+            },
+            true,
+        ) = (
             &boot_options.sidecar,
             has_devices_that_should_disable_sidecar,
         ) {
-            if cpu_threshold.is_none()
-                || cpu_threshold
-                    .and_then(|threshold| threshold.try_into().ok())
-                    .is_some_and(|threshold| parsed.cpu_count() < threshold)
+            if !kexec_servicing
+                && (cpu_threshold.is_none()
+                    || cpu_threshold
+                        .and_then(|threshold| threshold.try_into().ok())
+                        .is_some_and(|threshold| parsed.cpu_count() < threshold))
             {
                 // If we are in the restore path, disable sidecar for small VMs, as the amortization
                 // benefits don't apply when devices are kept alive; the CPUs need to be powered on anyway
                 // to check for interrupts.
+                //
+                // However, during kexec servicing, sidecar memory is preserved and reused, so we
+                // should NOT disable sidecar here.
                 log!("disabling sidecar, as we are restoring from persisted state");
                 boot_options.sidecar = SidecarOptions::DisabledServicing;
                 options.sidecar = SidecarOptions::DisabledServicing;

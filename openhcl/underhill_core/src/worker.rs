@@ -119,8 +119,8 @@ use socket2::Socket;
 use state_unit::SpawnedUnit;
 use state_unit::StateUnits;
 use std::collections::HashMap;
-use std::ffi::CString;
 use std::env;
+use std::ffi::CString;
 use std::future;
 use std::sync::Arc;
 use std::thread::JoinHandle;
@@ -1994,7 +1994,15 @@ async fn new_underhill_vm(
     };
 
     // Read measured config from VTL0 memory. When restoring, it is already gone.
-    let kexec_servicing = env::var_os("OPENHCL_KEXEC_SERVICING").is_some();
+    let kexec_servicing = std::fs::read_to_string("/proc/cmdline")
+        .ok()
+        .and_then(|cmdline| {
+            cmdline
+                .split_whitespace()
+                .any(|arg| arg.starts_with("OPENHCL_KEXEC_SERVICING="))
+                .then_some(())
+        })
+        .is_some();
 
     let (firmware_type, measured_vtl0_info, load_kind) = {
         if let Some(firmware_type) = servicing_state.firmware_type {

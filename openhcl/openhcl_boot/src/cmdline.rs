@@ -91,6 +91,9 @@ pub enum SidecarOptions {
     Enabled {
         enable_logging: bool,
         cpu_threshold: Option<u32>,
+        /// If true, this is a kexec restore (not regular servicing), so sidecar
+        /// memory will be reused and sidecar should NOT be disabled.
+        kexec_servicing: bool,
     },
     /// Sidecar is disabled because this is a restore from save state (during servicing),
     /// and sidecar will not benefit this specific scenario.
@@ -105,6 +108,7 @@ impl SidecarOptions {
         SidecarOptions::Enabled {
             enable_logging: false,
             cpu_threshold: Self::DEFAULT_CPU_THRESHOLD,
+            kexec_servicing: false,
         }
     }
 }
@@ -159,12 +163,14 @@ impl BootCommandLineOptions {
                                 self.sidecar = SidecarOptions::Enabled {
                                     enable_logging: false,
                                     cpu_threshold: SidecarOptions::DEFAULT_CPU_THRESHOLD,
+                                    kexec_servicing: false,
                                 }
                             }
                             "log" => {
                                 self.sidecar = SidecarOptions::Enabled {
                                     enable_logging: true,
                                     cpu_threshold: SidecarOptions::DEFAULT_CPU_THRESHOLD,
+                                    kexec_servicing: false,
                                 }
                             }
                             _ => {}
@@ -175,6 +181,21 @@ impl BootCommandLineOptions {
                 let arg = arg.split_once('=').map(|(_, arg)| arg);
                 if arg.is_some_and(|a| a != "0") {
                     self.disable_nvme_keep_alive = true;
+                }
+            } else if arg.starts_with("OPENHCL_KEXEC_SERVICING=") {
+                // During kexec servicing, sidecar memory is reused (not reallocated)
+                // so we should NOT disable sidecar even for small VMs with devices
+                if let SidecarOptions::Enabled {
+                    enable_logging,
+                    cpu_threshold,
+                    ..
+                } = self.sidecar
+                {
+                    self.sidecar = SidecarOptions::Enabled {
+                        enable_logging,
+                        cpu_threshold,
+                        kexec_servicing: true,
+                    };
                 }
             }
         }

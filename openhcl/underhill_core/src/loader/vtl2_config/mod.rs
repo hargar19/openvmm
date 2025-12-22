@@ -422,10 +422,8 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
         tracing::warn!(
             CVM_ALLOWED,
             measured_magic = format_args!("0x{magic:016x}", magic = measured_config.magic),
-            expected_magic = format_args!(
-                "0x{magic:016x}",
-                magic = ParavisorMeasuredVtl2Config::MAGIC
-            ),
+            expected_magic =
+                format_args!("0x{magic:016x}", magic = ParavisorMeasuredVtl2Config::MAGIC),
             "measured VTL2 config magic missing, attempting persisted fallback",
         );
         tracing::info!(

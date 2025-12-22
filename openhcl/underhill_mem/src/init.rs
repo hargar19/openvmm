@@ -117,7 +117,15 @@ pub async fn init(params: &Init<'_>) -> anyhow::Result<MemoryMappings> {
 
     if let Some(boot_init) = &params.boot_init {
         if !params.isolation.is_isolated() {
-            let servicing_boot = env::var_os("OPENHCL_KEXEC_SERVICING").is_some();
+            let servicing_boot = std::fs::read_to_string("/proc/cmdline")
+                .ok()
+                .and_then(|cmdline| {
+                    cmdline
+                        .split_whitespace()
+                        .any(|arg| arg.starts_with("OPENHCL_KEXEC_SERVICING="))
+                        .then_some(())
+                })
+                .is_some();
             // TODO: VTL 2 protections are applied in the boot shim for isolated
             // VMs. Since non-isolated VMs can undergo servicing and this is an
             // expensive operation, continue to apply protections here for now. In
