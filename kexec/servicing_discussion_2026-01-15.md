@@ -1,5 +1,7 @@
 # OpenVMM / Underhill (OpenHCL) Servicing — Discussion Notes (2026-01-15)
 
+Highlevel: Servicing reboots VTL2 by creating a save/restore boundary around the VTL2 instance: VTL2 quiesces, saves its servicing state, and sends the blob to the host; then the host triggers a VTL2 reload (a reset boundary for the management VTL, not a full VM reboot). A fresh VTL2 instance boots, detects it’s a servicing restore, pulls the saved blob from the host, restores device/worker state, and resumes. 
+
 These notes capture our discussion about “servicing” an Underhill/OpenHCL VM in this repo, including what the restart command means, how the save/reload/restore pipeline works (OpenVMM vs Hyper-V), and how your `kexec/servicing_logs` confirm the flow.
 
 ## Terminology
