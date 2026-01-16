@@ -497,9 +497,15 @@ impl UnderhillVmWorker {
 
         // In a servicing scenario where the saved state is held on the VM host,
         // we only know that saved state exists after we get the DPS information.
-        let saved_state_from_host = dps.general.is_servicing_scenario;
+        //
+        // For guest-side `kexec` experiments we won't get a host-driven "servicing
+        // scenario" indicator (there is no VTL2 reload). Allow a best-effort
+        // restore when the kexec script marks the boot with OPENHCL_KEXEC_SERVICING.
+        let servicing_state_from_host = dps.general.is_servicing_scenario;
+        let kexec_servicing = std::env::var_os("OPENHCL_KEXEC_SERVICING").is_some();
+        let mut restored_state_from_host = false;
 
-        if saved_state_from_host {
+        if servicing_state_from_host || kexec_servicing {
             assert!(
                 servicing_state.is_none(),
                 "cannot have saved state from two different sources"
@@ -517,22 +523,36 @@ impl UnderhillVmWorker {
                 "VTL2 restart, getting servicing state from the host"
             );
 
-            let saved_state_buf = get_client
+            match get_client
                 .get_saved_state_from_host()
                 .instrument(tracing::info_span!("init/get_saved_state", CVM_ALLOWED))
                 .await
-                .context("Failed to get saved state from host")?;
-
-            servicing_state = Some(
-                mesh::payload::decode(&saved_state_buf)
-                    .context("failed to decode servicing state")?,
-            );
-
-            tracing::info!(
-                CVM_ALLOWED,
-                saved_state_len = saved_state_buf.len(),
-                "received servicing state from host"
-            );
+            {
+                Ok(saved_state_buf) => {
+                    servicing_state = Some(
+                        mesh::payload::decode(&saved_state_buf)
+                            .context("failed to decode servicing state")?,
+                    );
+                    restored_state_from_host = true;
+                    tracing::info!(
+                        CVM_ALLOWED,
+                        saved_state_len = saved_state_buf.len(),
+                        "received servicing state from host"
+                    );
+                }
+                Err(err) if kexec_servicing && !servicing_state_from_host => {
+                    // For kexec experiments, tolerate missing state and continue
+                    // a normal boot; the host may not have been primed with a save.
+                    tracing::warn!(
+                        CVM_ALLOWED,
+                        ?err,
+                        "OPENHCL_KEXEC_SERVICING set but host returned no saved state; continuing without restore"
+                    );
+                }
+                Err(err) => {
+                    return Err(err).context("Failed to get saved state from host");
+                }
+            }
         }
 
         if let Some(state) = &mut servicing_state {
@@ -588,7 +608,7 @@ impl UnderhillVmWorker {
             // that servicing was successful.
             //
             // TODO: send error string to host.
-            if saved_state_from_host {
+            if restored_state_from_host {
                 get_client.report_restore_result_to_host(r.is_ok()).await;
             }
 

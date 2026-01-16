@@ -54,6 +54,8 @@ use socket2::Socket;
 use state_unit::SavedStateUnit;
 use state_unit::SpawnedUnit;
 use state_unit::StateUnits;
+use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::Instrument;
@@ -545,9 +547,34 @@ impl LoadedVm {
                 Ok(state)
             }) {
             Ok(state) => {
-                self.get_client
-                    .send_servicing_state(mesh::payload::encode(state))
-                    .await?;
+                let state_buf = mesh::payload::encode(state);
+                tracing::info!(
+                    CVM_ALLOWED,
+                    %correlation_id,
+                    saved_state_len = state_buf.len(),
+                    "servicing save completed; preparing to send state to host"
+                );
+
+                // Experimental: if enabled, restart VTL2 from inside the guest
+                // using Linux kexec rather than waiting for the host-driven
+                // VTL2 reload boundary.
+                //
+                // NOTE: This hook is intentionally placed before awaiting the
+                // host response so we can validate the kexec path even if the
+                // host reload would otherwise interrupt this flow.
+                self.try_kexec_after_servicing(correlation_id, "pre_send");
+
+                tracing::info!(
+                    CVM_ALLOWED,
+                    %correlation_id,
+                    "sending servicing state to host"
+                );
+                self.get_client.send_servicing_state(state_buf).await?;
+                tracing::info!(
+                    CVM_ALLOWED,
+                    %correlation_id,
+                    "servicing state sent to host"
+                );
 
                 true
             }
@@ -570,6 +597,55 @@ impl LoadedVm {
         };
 
         Ok(success)
+    }
+
+    fn try_kexec_after_servicing(&self, correlation_id: Guid, phase: &'static str) {
+        // Keep this logic local and opt-in to avoid changing default servicing behavior.
+        let enabled = std::env::var_os("OPENHCL_SERVICING_RESTART_VIA_KEXEC").is_some();
+        tracing::info!(
+            CVM_ALLOWED,
+            %correlation_id,
+            phase,
+            enabled,
+            "kexec servicing hook evaluated"
+        );
+        if !enabled {
+            return;
+        }
+
+        let script = std::env::var_os("OPENHCL_KEXEC_SCRIPT")
+            .unwrap_or_else(|| "/kexec/kexec_test.sh".into());
+        let script = Path::new(&script);
+
+        tracing::info!(
+            CVM_ALLOWED,
+            %correlation_id,
+            phase,
+            script = %script.display(),
+            "servicing save completed; attempting guest-side kexec restart"
+        );
+
+        if !script.exists() {
+            tracing::error!(
+                CVM_ALLOWED,
+                %correlation_id,
+                script = %script.display(),
+                "kexec restart requested but script does not exist; falling back to host restart"
+            );
+            return;
+        }
+
+        // Exec replaces the current process image. If it succeeds, it never returns.
+        // If it returns, it is always an error.
+        let err = std::process::Command::new("/bin/sh").arg(script).exec();
+        tracing::error!(
+            CVM_ALLOWED,
+            %correlation_id,
+            phase,
+            error = &err as &dyn std::error::Error,
+            script = %script.display(),
+            "failed to exec kexec script via /bin/sh; falling back to host restart"
+        );
     }
 
     async fn handle_servicing_inner(
