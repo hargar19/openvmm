@@ -419,12 +419,23 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
 
     drop(mapping);
 
-    assert_eq!(measured_config.magic, ParavisorMeasuredVtl2Config::MAGIC);
-
-    let vtom_offset_bit = if measured_config.vtom_offset_bit == 0 {
+    // After a kexec boot, the config pages have been zeroed by the previous
+    // instance's Vtl2ParamsMap drop (zero_on_drop), so the magic field will
+    // be 0. This is expected and we treat it as having no measured config.
+    // Any other non-matching magic indicates corruption and should still panic.
+    let vtom_offset_bit = if measured_config.magic == 0 {
+        tracing::info!(
+            CVM_ALLOWED,
+            "measured vtl2 config magic is zero (kexec boot), using defaults"
+        );
         None
     } else {
-        Some(measured_config.vtom_offset_bit)
+        assert_eq!(measured_config.magic, ParavisorMeasuredVtl2Config::MAGIC);
+        if measured_config.vtom_offset_bit == 0 {
+            None
+        } else {
+            Some(measured_config.vtom_offset_bit)
+        }
     };
 
     let runtime_params = RuntimeParameters {
