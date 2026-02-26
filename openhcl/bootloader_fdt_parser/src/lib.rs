@@ -161,6 +161,9 @@ pub struct ParsedBootDtInfo {
     pub vtl2_persisted_header: MemoryRange,
     /// The memory range that contains the persisted protobuf region.
     pub vtl2_persisted_protobuf_region: MemoryRange,
+    /// The memory range that contains the persisted servicing state region
+    /// for kexec.
+    pub vtl2_persisted_servicing_state: MemoryRange,
     /// The ranges that were accepted at load time by the host on behalf of the
     /// guest.
     #[inspect(iter_by_index)]
@@ -215,6 +218,7 @@ struct OpenhclInfo {
     private_pool_ranges: Vec<MemoryRangeWithNode>,
     vtl2_persisted_header: MemoryRange,
     vtl2_persisted_protobuf_region: MemoryRange,
+    vtl2_persisted_servicing_state: MemoryRange,
 }
 
 fn parse_memory_openhcl(node: &Node<'_>) -> anyhow::Result<AddressRange> {
@@ -439,6 +443,27 @@ fn parse_openhcl(node: &Node<'_>) -> anyhow::Result<OpenhclInfo> {
         region
     };
 
+    // Report the persisted servicing state region range.
+    let vtl2_persisted_servicing_state = {
+        let mut region_iter = memory.iter().filter_map(|entry| {
+            if entry.vtl_usage() == MemoryVtlType::VTL2_PERSISTED_SERVICING_STATE {
+                Some(*entry.range())
+            } else {
+                None
+            }
+        });
+
+        let region = region_iter.next().ok_or(anyhow::anyhow!(
+            "no VTL2 persisted servicing state region range found"
+        ))?;
+
+        if region_iter.next().is_some() {
+            bail!("multiple VTL2 persisted servicing state region ranges found");
+        }
+
+        region
+    };
+
     let vtl0_alias_map = try_find_property(node, "vtl0-alias-map")
         .map(|prop| prop.read_u64(0).map_err(err_to_owned))
         .transpose()
@@ -468,6 +493,7 @@ fn parse_openhcl(node: &Node<'_>) -> anyhow::Result<OpenhclInfo> {
         private_pool_ranges,
         vtl2_persisted_header,
         vtl2_persisted_protobuf_region,
+        vtl2_persisted_servicing_state,
     })
 }
 
@@ -600,6 +626,7 @@ impl ParsedBootDtInfo {
         let mut private_pool_ranges = Vec::new();
         let mut vtl2_persisted_header = MemoryRange::EMPTY;
         let mut vtl2_persisted_protobuf_region = MemoryRange::EMPTY;
+        let mut vtl2_persisted_servicing_state = MemoryRange::EMPTY;
 
         let parser = Parser::new(raw)
             .map_err(err_to_owned)
@@ -631,6 +658,7 @@ impl ParsedBootDtInfo {
                         private_pool_ranges: n_private_pool_ranges,
                         vtl2_persisted_header: n_vtl2_persisted_header,
                         vtl2_persisted_protobuf_region: n_vtl2_persisted_protobuf_region,
+                        vtl2_persisted_servicing_state: n_vtl2_persisted_servicing_state,
                     } = parse_openhcl(&child)?;
                     vtl0_mmio = n_vtl0_mmio;
                     config_ranges = n_config_ranges;
@@ -643,6 +671,7 @@ impl ParsedBootDtInfo {
                     private_pool_ranges = n_private_pool_ranges;
                     vtl2_persisted_header = n_vtl2_persisted_header;
                     vtl2_persisted_protobuf_region = n_vtl2_persisted_protobuf_region;
+                    vtl2_persisted_servicing_state = n_vtl2_persisted_servicing_state;
                 }
 
                 _ if child.name.starts_with("memory@") => {
@@ -687,6 +716,7 @@ impl ParsedBootDtInfo {
             private_pool_ranges,
             vtl2_persisted_header,
             vtl2_persisted_protobuf_region,
+            vtl2_persisted_servicing_state,
         })
     }
 }
@@ -1045,6 +1075,14 @@ mod tests {
                 }),
                 AddressRange::Memory(Memory {
                     range: MemoryRangeWithNode {
+                        range: MemoryRange::new(0x52000..0x53000),
+                        vnode: 0,
+                    },
+                    vtl_usage: MemoryVtlType::VTL2_PERSISTED_SERVICING_STATE,
+                    igvm_type: MemoryMapEntryType::VTL2_PROTECTABLE,
+                }),
+                AddressRange::Memory(Memory {
+                    range: MemoryRangeWithNode {
                         range: MemoryRange::new(0x60000..0x70000),
                         vnode: 0,
                     },
@@ -1099,6 +1137,7 @@ mod tests {
             }],
             vtl2_persisted_header: MemoryRange::new(0x50000..0x51000),
             vtl2_persisted_protobuf_region: MemoryRange::new(0x51000..0x52000),
+            vtl2_persisted_servicing_state: MemoryRange::new(0x52000..0x53000),
         };
 
         let dt = build_dt(&orig_info).unwrap();
