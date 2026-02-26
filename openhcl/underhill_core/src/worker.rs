@@ -1803,6 +1803,10 @@ async fn new_underhill_vm(
         "vtom must be present if and only if hardware isolation is enabled"
     );
 
+    // During kexec-based servicing, skip sidecar to match the original
+    // servicing behavior where openhcl_boot disables sidecar on reload.
+    let kexec_servicing = std::env::var_os("OPENHCL_KEXEC_SERVICING").is_some();
+
     // Construct the underhill partition instance. This contains much of the configuration of the guest deposited by
     // the host, along with additional device configuration and transports.
     let params = UhPartitionNewParams {
@@ -1814,6 +1818,7 @@ async fn new_underhill_vm(
         vtom,
         handle_synic: with_vmbus,
         no_sidecar_hotplug: env_cfg.no_sidecar_hotplug,
+        skip_sidecar: kexec_servicing,
         use_mmio_hypercalls,
         intercept_debug_exceptions: env_cfg.gdbstub,
         hide_isolation,
@@ -3513,6 +3518,28 @@ async fn new_underhill_vm(
     dma_manager
         .validate_restore()
         .context("failed to validate restore for dma manager")?;
+
+    // During kexec-based servicing, sidecar is skipped so all CPUs must be
+    // online before spawning VPs. This matches the original servicing
+    // behavior where openhcl_boot disables sidecar and all CPUs boot via SMP.
+    if kexec_servicing {
+        let vp_count = processor_topology.vp_count();
+        tracing::info!(
+            CVM_ALLOWED,
+            vp_count,
+            "kexec servicing: onlining all CPUs to match original servicing behavior"
+        );
+        for cpu in 0..vp_count {
+            if let Err(err) = underhill_threadpool::set_cpu_online(cpu) {
+                tracing::warn!(
+                    CVM_ALLOWED,
+                    cpu,
+                    error = &err as &dyn std::error::Error,
+                    "failed to online CPU during kexec servicing"
+                );
+            }
+        }
+    }
 
     // Start the VP tasks on the thread pool.
     crate::vp::spawn_vps(tp, vps, vp_runners, &chipset, isolation)
