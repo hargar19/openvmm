@@ -443,7 +443,8 @@ mod x86_boot {
                 | MemoryVtlType::VTL2_TDX_PAGE_TABLES
                 | MemoryVtlType::VTL2_BOOTSHIM_LOG_BUFFER
                 | MemoryVtlType::VTL2_PERSISTED_STATE_HEADER
-                | MemoryVtlType::VTL2_PERSISTED_STATE_PROTOBUF => {
+                | MemoryVtlType::VTL2_PERSISTED_STATE_PROTOBUF
+                | MemoryVtlType::VTL2_PERSISTED_SERVICING_STATE => {
                     add_e820_entry(entries.next(), range, E820_RESERVED)?;
                     n += 1;
                 }
@@ -1149,12 +1150,16 @@ mod test {
 
         assert!(build_e820_map(&mut boot_params, &mut ext, &address_space).is_ok());
 
+        // persisted region is split 3 ways: header (1 page), protobuf (1 page),
+        // servicing state (2 pages).
+        let persisted_protobuf_end = ONE_MB + 2 * PAGE_SIZE;
         check_e820(
             &boot_params,
             &ext,
             &[
-                (ONE_MB..(persisted_header_end), E820_RESERVED),
-                (persisted_header_end..persisted_end, E820_RESERVED),
+                (ONE_MB..persisted_header_end, E820_RESERVED),
+                (persisted_header_end..persisted_protobuf_end, E820_RESERVED),
+                (persisted_protobuf_end..persisted_end, E820_RESERVED),
                 (persisted_end..2 * ONE_MB, E820_RAM),
                 (2 * ONE_MB..3 * ONE_MB, E820_RESERVED),
                 (3 * ONE_MB..4 * ONE_MB, E820_RAM),
@@ -1180,12 +1185,14 @@ mod test {
 
         assert!(build_e820_map(&mut boot_params, &mut ext, &address_space).is_ok());
 
+        let persisted_protobuf_end = ONE_MB + 2 * PAGE_SIZE;
         check_e820(
             &boot_params,
             &ext,
             &[
-                (ONE_MB..(persisted_header_end), E820_RESERVED),
-                (persisted_header_end..persisted_end, E820_RESERVED),
+                (ONE_MB..persisted_header_end, E820_RESERVED),
+                (persisted_header_end..persisted_protobuf_end, E820_RESERVED),
+                (persisted_protobuf_end..persisted_end, E820_RESERVED),
                 (persisted_end..2 * ONE_MB, E820_RAM),
                 (2 * ONE_MB..3 * ONE_MB, E820_RESERVED),
                 (3 * ONE_MB..4 * ONE_MB, E820_RAM),
@@ -1216,12 +1223,14 @@ mod test {
 
         assert!(build_e820_map(&mut boot_params, &mut ext, &address_space).is_ok());
 
+        let persisted_protobuf_end = ONE_MB + 2 * PAGE_SIZE;
         check_e820(
             &boot_params,
             &ext,
             &[
-                (ONE_MB..(persisted_header_end), E820_RESERVED),
-                (persisted_header_end..persisted_end, E820_RESERVED),
+                (ONE_MB..persisted_header_end, E820_RESERVED),
+                (persisted_header_end..persisted_protobuf_end, E820_RESERVED),
+                (persisted_protobuf_end..persisted_end, E820_RESERVED),
                 (persisted_end..2 * ONE_MB, E820_RAM),
                 (2 * ONE_MB..3 * ONE_MB, E820_RESERVED),
                 (3 * ONE_MB..4 * ONE_MB, E820_RAM),
@@ -1262,7 +1271,8 @@ mod test {
             &ext,
             &[
                 (ONE_MB..(persisted_header_end), E820_RESERVED),
-                (persisted_header_end..persisted_end, E820_RESERVED),
+                (persisted_header_end..(ONE_MB + 2 * PAGE_SIZE), E820_RESERVED),
+                ((ONE_MB + 2 * PAGE_SIZE)..persisted_end, E820_RESERVED),
                 (persisted_end..2 * ONE_MB, E820_RAM),
                 (2 * ONE_MB..3 * ONE_MB, E820_RESERVED),
                 (3 * ONE_MB..4 * ONE_MB, E820_RAM),
