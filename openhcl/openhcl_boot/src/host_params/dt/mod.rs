@@ -679,12 +679,11 @@ fn topology_from_host_dt(
             ..(params.parameter_region_start + params.parameter_region_size),
     );
 
-    // NOTE: Size the region as 20 pages. This should be plenty enough for the
-    // worst case encoded size (about 50 bytes worst case per memory entry, with
-    // the max number of ram ranges), and is small enough that we can reserve it
-    // on all sizes. Revisit this calculation if we persist more state in the
-    // future.
-    const PERSISTED_REGION_SIZE: u64 = 20 * 4096;
+    // NOTE: Size the region as 64 pages (256KB). This must be large enough to
+    // hold the topology protobuf and the servicing state payload for kexec.
+    // The region is split three ways: header (1 page), topology protobuf
+    // (half remainder), and servicing state (half remainder).
+    const PERSISTED_REGION_SIZE: u64 = 64 * 4096;
     let (persisted_state_region, remainder) = params
         .persisted_state
         .split_at_offset(PERSISTED_REGION_SIZE);
@@ -870,13 +869,17 @@ fn topology_from_persisted_state(
         .iter()
         .find(|entry| entry.vtl_type == MemoryVtlType::VTL2_PERSISTED_STATE_HEADER)
         .expect("persisted state header missing");
-    let persisted_protobuf = partition_memory
+    let _persisted_protobuf = partition_memory
         .iter()
         .find(|entry| entry.vtl_type == MemoryVtlType::VTL2_PERSISTED_STATE_PROTOBUF)
         .expect("persisted state protobuf region missing");
+    let persisted_servicing = partition_memory
+        .iter()
+        .find(|entry| entry.vtl_type == MemoryVtlType::VTL2_PERSISTED_SERVICING_STATE)
+        .expect("persisted servicing state region missing");
     assert_eq!(persisted_header.range.end(), protobuf_region.start());
     let persisted_state_region =
-        MemoryRange::new(persisted_header.range.start()..persisted_protobuf.range.end());
+        MemoryRange::new(persisted_header.range.start()..persisted_servicing.range.end());
 
     // The host provided device tree is marked as normal ram, as the
     // bootshim is responsible for constructing anything usermode needs from

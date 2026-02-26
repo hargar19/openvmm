@@ -20,7 +20,7 @@ const PAGE_SIZE_4K: u64 = 4096;
 
 /// The maximum number of reserved memory ranges that we might use.
 /// See [`ReservedMemoryType`] definition for details.
-pub const MAX_RESERVED_MEM_RANGES: usize = 6 + sidecar_defs::MAX_NODES;
+pub const MAX_RESERVED_MEM_RANGES: usize = 7 + sidecar_defs::MAX_NODES;
 
 const MAX_MEMORY_RANGES: usize = MAX_VTL2_RAM_RANGES + MAX_RESERVED_MEM_RANGES;
 
@@ -50,6 +50,8 @@ pub enum ReservedMemoryType {
     PersistedStateHeader,
     /// Persisted state payload.
     PersistedStatePayload,
+    /// Persisted servicing state for kexec.
+    PersistedServicingState,
 }
 
 impl From<ReservedMemoryType> for MemoryVtlType {
@@ -65,6 +67,9 @@ impl From<ReservedMemoryType> for MemoryVtlType {
             ReservedMemoryType::PersistedStateHeader => MemoryVtlType::VTL2_PERSISTED_STATE_HEADER,
             ReservedMemoryType::PersistedStatePayload => {
                 MemoryVtlType::VTL2_PERSISTED_STATE_PROTOBUF
+            }
+            ReservedMemoryType::PersistedServicingState => {
+                MemoryVtlType::VTL2_PERSISTED_SERVICING_STATE
             }
         }
     }
@@ -234,11 +239,13 @@ impl<'a, I: Iterator<Item = MemoryRange>> AddressSpaceManagerBuilder<'a, I> {
             return Err(Error::AlreadyInitialized);
         }
 
-        // Split the persisted state region into two: the header which is the
-        // first 4K page, and the remainder which is the protobuf payload. Both
-        // are reserved ranges.
-        let (persisted_header, persisted_payload) =
+        // Split the persisted state region into three: the header which is the
+        // first 4K page, the topology protobuf payload, and the servicing
+        // state region for kexec. All are reserved ranges.
+        let (persisted_header, remainder) =
             persisted_state_region.split_at_offset(PAGE_SIZE_4K);
+        let half = (remainder.len() / 2) & !(PAGE_SIZE_4K - 1);
+        let (persisted_payload, persisted_servicing) = remainder.split_at_offset(half);
 
         // The other ranges are reserved, and must overlap with the used range.
         const MAX_RESERVED_RANGES: usize = 20;
@@ -246,6 +253,7 @@ impl<'a, I: Iterator<Item = MemoryRange>> AddressSpaceManagerBuilder<'a, I> {
         reserved.clear();
         reserved.push((persisted_header, ReservedMemoryType::PersistedStateHeader));
         reserved.push((persisted_payload, ReservedMemoryType::PersistedStatePayload));
+        reserved.push((persisted_servicing, ReservedMemoryType::PersistedServicingState));
         reserved.extend(vtl2_config.map(|r| (r, ReservedMemoryType::Vtl2Config)));
         reserved.extend(
             reserved_range
@@ -1011,8 +1019,12 @@ mod tests {
                 MemoryVtlType::VTL2_PERSISTED_STATE_HEADER,
             ),
             (
-                MemoryRange::new(0x1000..0xE000),
+                MemoryRange::new(0x1000..0x7000),
                 MemoryVtlType::VTL2_PERSISTED_STATE_PROTOBUF,
+            ),
+            (
+                MemoryRange::new(0x7000..0xE000),
+                MemoryVtlType::VTL2_PERSISTED_SERVICING_STATE,
             ),
             (MemoryRange::new(0xE000..0xF000), MemoryVtlType::VTL2_CONFIG),
             (MemoryRange::new(0xF000..0x20000), MemoryVtlType::VTL2_RAM),
@@ -1040,8 +1052,12 @@ mod tests {
                 MemoryVtlType::VTL2_PERSISTED_STATE_HEADER,
             ),
             (
-                MemoryRange::new(0x1000..0xA000),
+                MemoryRange::new(0x1000..0x5000),
                 MemoryVtlType::VTL2_PERSISTED_STATE_PROTOBUF,
+            ),
+            (
+                MemoryRange::new(0x5000..0xA000),
+                MemoryVtlType::VTL2_PERSISTED_SERVICING_STATE,
             ),
             (MemoryRange::new(0xA000..0xE000), MemoryVtlType::VTL2_RAM),
             (MemoryRange::new(0xE000..0xF000), MemoryVtlType::VTL2_CONFIG),
