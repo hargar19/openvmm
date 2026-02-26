@@ -534,39 +534,83 @@ impl UnderhillVmWorker {
                 future::pending::<()>().await;
             }
 
-            tracing::info!(
-                CVM_ALLOWED,
-                "VTL2 restart, getting servicing state from the host"
-            );
+            // For kexec-based servicing, try to read the servicing state from
+            // the persisted memory region first. This avoids a round-trip to
+            // the host and works even when the host is not primed with state.
+            if kexec_servicing {
+                tracing::info!(
+                    CVM_ALLOWED,
+                    "kexec servicing: attempting to read persisted servicing state"
+                );
 
-            match get_client
-                .get_saved_state_from_host()
-                .instrument(tracing::info_span!("init/get_saved_state", CVM_ALLOWED))
-                .await
-            {
-                Ok(saved_state_buf) => {
-                    servicing_state = Some(
-                        mesh::payload::decode(&saved_state_buf)
-                            .context("failed to decode servicing state")?,
-                    );
-                    restored_state_from_host = true;
-                    tracing::info!(
-                        CVM_ALLOWED,
-                        saved_state_len = saved_state_buf.len(),
-                        "received servicing state from host"
-                    );
+                match bootloader_fdt_parser::ParsedBootDtInfo::new()
+                    .and_then(|parsed| {
+                        crate::loader::vtl2_config::read_servicing_state_from_persisted(&parsed)
+                    }) {
+                    Ok(Some(saved_state_buf)) => {
+                        servicing_state = Some(
+                            mesh::payload::decode(&saved_state_buf)
+                                .context("failed to decode persisted servicing state")?,
+                        );
+                        tracing::info!(
+                            CVM_ALLOWED,
+                            saved_state_len = saved_state_buf.len(),
+                            "restored servicing state from persisted memory"
+                        );
+                    }
+                    Ok(None) => {
+                        tracing::info!(
+                            CVM_ALLOWED,
+                            "no persisted servicing state found; will try host"
+                        );
+                    }
+                    Err(err) => {
+                        tracing::warn!(
+                            CVM_ALLOWED,
+                            ?err,
+                            "failed to read persisted servicing state; will try host"
+                        );
+                    }
                 }
-                Err(err) if kexec_servicing && !servicing_state_from_host => {
-                    // For kexec experiments, tolerate missing state and continue
-                    // a normal boot; the host may not have been primed with a save.
-                    tracing::warn!(
-                        CVM_ALLOWED,
-                        ?err,
-                        "OPENHCL_KEXEC_SERVICING set but host returned no saved state; continuing without restore"
-                    );
-                }
-                Err(err) => {
-                    return Err(err).context("Failed to get saved state from host");
+            }
+
+            // If we still don't have state (either not kexec or persisted read
+            // failed/empty), fall back to getting it from the host.
+            if servicing_state.is_none() {
+                tracing::info!(
+                    CVM_ALLOWED,
+                    "VTL2 restart, getting servicing state from the host"
+                );
+
+                match get_client
+                    .get_saved_state_from_host()
+                    .instrument(tracing::info_span!("init/get_saved_state", CVM_ALLOWED))
+                    .await
+                {
+                    Ok(saved_state_buf) => {
+                        servicing_state = Some(
+                            mesh::payload::decode(&saved_state_buf)
+                                .context("failed to decode servicing state")?,
+                        );
+                        restored_state_from_host = true;
+                        tracing::info!(
+                            CVM_ALLOWED,
+                            saved_state_len = saved_state_buf.len(),
+                            "received servicing state from host"
+                        );
+                    }
+                    Err(err) if kexec_servicing && !servicing_state_from_host => {
+                        // For kexec experiments, tolerate missing state and continue
+                        // a normal boot; the host may not have been primed with a save.
+                        tracing::warn!(
+                            CVM_ALLOWED,
+                            ?err,
+                            "OPENHCL_KEXEC_SERVICING set but host returned no saved state; continuing without restore"
+                        );
+                    }
+                    Err(err) => {
+                        return Err(err).context("Failed to get saved state from host");
+                    }
                 }
             }
         }
