@@ -434,14 +434,27 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
         )
         .context("failed to read measured vtl2 config")?;
 
-    assert_eq!(measured_config.magic, ParavisorMeasuredVtl2Config::MAGIC);
+    // After a kexec boot, the config pages have been zeroed by the previous
+    // instance's Vtl2ParamsMap drop (zero_on_drop), so the magic field will
+    // be 0. This is expected and we treat it as having no measured config.
+    // Any other non-matching magic indicates corruption and should still panic.
+    let has_measured_config = if measured_config.magic == 0 {
+        tracing::info!(
+            CVM_ALLOWED,
+            "measured vtl2 config magic is zero (kexec boot), using defaults"
+        );
+        false
+    } else {
+        assert_eq!(measured_config.magic, ParavisorMeasuredVtl2Config::MAGIC);
+        true
+    };
 
     // The optional `ProductPolicy` payload is only read when the
     // `product_policy` feature is enabled; otherwise it is ignored.
     #[cfg(feature = "product_policy")]
     let product_policy = {
         let size = measured_config.product_policy_size as usize;
-        if size == 0 {
+        if !has_measured_config || size == 0 {
             product_policy::MeasuredProductPolicy::new(None)
         } else {
             // Defence-in-depth: the IGVM importer caps this at build
@@ -474,7 +487,7 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
 
     drop(mapping);
 
-    let vtom_offset_bit = if measured_config.vtom_offset_bit == 0 {
+    let vtom_offset_bit = if !has_measured_config || measured_config.vtom_offset_bit == 0 {
         None
     } else {
         Some(measured_config.vtom_offset_bit)
