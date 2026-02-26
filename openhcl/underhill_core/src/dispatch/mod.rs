@@ -624,10 +624,14 @@ impl LoadedVm {
                 // using Linux kexec rather than waiting for the host-driven
                 // VTL2 reload boundary.
                 //
-                // NOTE: This hook is intentionally placed before awaiting the
-                // host response so we can validate the kexec path even if the
-                // host reload would otherwise interrupt this flow.
-                self.try_kexec_after_servicing(correlation_id, "pre_send");
+                // This hook runs BEFORE sending state to the host.  The state
+                // is persisted into a reserved memory region so the kexec'd
+                // VTL2 can read it back.  If kexec succeeds (exec never
+                // returns), the NEW VTL2 instance will send the state to the
+                // host to complete the save protocol.  If kexec fails (script
+                // missing, exec error, etc.), we fall through and send state
+                // normally for the host-driven reload path.
+                self.try_kexec_after_servicing(correlation_id, "pre_send", &state_buf);
 
                 tracing::info!(
                     CVM_ALLOWED,
@@ -664,7 +668,12 @@ impl LoadedVm {
         Ok(success)
     }
 
-    fn try_kexec_after_servicing(&self, correlation_id: Guid, phase: &'static str) {
+    fn try_kexec_after_servicing(
+        &self,
+        correlation_id: Guid,
+        phase: &'static str,
+        state_buf: &[u8],
+    ) {
         // Keep this logic local and opt-in to avoid changing default servicing behavior.
         let enabled = std::env::var_os("OPENHCL_SERVICING_RESTART_VIA_KEXEC").is_some();
         tracing::info!(
@@ -675,6 +684,21 @@ impl LoadedVm {
             "kexec servicing hook evaluated"
         );
         if !enabled {
+            return;
+        }
+
+        // Persist the servicing state into the reserved memory region so the
+        // next instance can read it back without involving the host.
+        let parsed = self.runtime_params.parsed_openhcl_boot();
+        if let Err(err) = crate::loader::vtl2_config::write_servicing_state_to_persisted(
+            parsed, state_buf,
+        ) {
+            tracing::error!(
+                CVM_ALLOWED,
+                %correlation_id,
+                error = err.as_ref() as &dyn std::error::Error,
+                "failed to persist servicing state for kexec; falling back to host restart"
+            );
             return;
         }
 
