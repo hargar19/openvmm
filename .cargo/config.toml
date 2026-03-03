@@ -47,6 +47,7 @@ CC_x86_64_unknown_linux_musl = { value = "build_support/underhill_cross/x86_64-u
 
 # Use the packaged verison of protoc, symlinked by repo setup tooling
 PROTOC = { value = ".packages/Google.Protobuf.Tools/tools/protoc", relative = true }
+PROTOC_INCLUDE = { value = ".packages/Google.Protobuf.Tools/tools/include", relative = true }
 
 # Path to sysroot (used by build_support/underhill_cross)
 X86_64_SYSROOT = { value = ".packages/extracted/x86_64-sysroot", relative = true }
