@@ -3,6 +3,7 @@
 
 //! Implements vm dispatch and vm state management for underhill.
 
+mod kexec_prepare;
 mod pci_shutdown;
 pub mod vtl2_settings_worker;
 
@@ -236,30 +237,37 @@ impl LoadedVm {
         // Background kexec pre-load: build the initramfs and stage the kernel
         // in kexec memory so that servicing only needs `kexec -e`.
         let _kexec_preload_task = if std::env::var_os("OPENHCL_SERVICING_RESTART_VIA_KEXEC").is_some() {
-            let prepare_script = std::env::var_os("OPENHCL_KEXEC_PREPARE_SCRIPT")
-                .unwrap_or_else(|| "/kexec/kexec_prepare.sh".into());
             Some(threadpool.spawn("kexec-preload", async move {
                 tracing::info!(CVM_ALLOWED, "starting background kexec pre-load");
-                match std::process::Command::new("/bin/sh")
-                    .arg(&prepare_script)
-                    .status()
-                {
-                    Ok(status) if status.success() => {
+
+                // Use native Rust implementation by default. If
+                // OPENHCL_KEXEC_PREPARE_SCRIPT is set, fall back to running
+                // that shell script instead (for debugging / override).
+                let result = if let Some(script) = std::env::var_os("OPENHCL_KEXEC_PREPARE_SCRIPT") {
+                    std::process::Command::new("/bin/sh")
+                        .arg(&script)
+                        .status()
+                        .map_err(anyhow::Error::from)
+                        .and_then(|s| {
+                            if s.success() {
+                                Ok(())
+                            } else {
+                                Err(anyhow::anyhow!("script exited with status: {}", s))
+                            }
+                        })
+                } else {
+                    kexec_prepare::prepare_kexec()
+                };
+
+                match result {
+                    Ok(()) => {
                         tracing::info!(CVM_ALLOWED, "kexec pre-load completed successfully");
-                    }
-                    Ok(status) => {
-                        tracing::warn!(
-                            CVM_ALLOWED,
-                            ?status,
-                            "kexec pre-load script exited with non-zero status; \
-                             servicing will fall back to inline build"
-                        );
                     }
                     Err(err) => {
                         tracing::warn!(
                             CVM_ALLOWED,
-                            error = &err as &dyn std::error::Error,
-                            "failed to run kexec pre-load script; \
+                            error = format!("{err:#}").as_str(),
+                            "kexec pre-load failed; \
                              servicing will fall back to inline build"
                         );
                     }
