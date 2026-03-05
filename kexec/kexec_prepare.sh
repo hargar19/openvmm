@@ -44,7 +44,9 @@ mkdir -p "$INITRD_DIR/bin" \
     "$INITRD_DIR/run" \
     "$INITRD_DIR/sys" \
     "$INITRD_DIR/tmp" \
-    "$INITRD_DIR/lib/modules"
+    "$INITRD_DIR/lib/modules/000" \
+    "$INITRD_DIR/lib/modules/001" \
+    "$INITRD_DIR/lib/modules/999"
 
 # Pre-mount device nodes — underhill_init's init_logging() opens these
 # BEFORE devtmpfs is mounted on /dev.  After the mount, the kernel
@@ -62,15 +64,22 @@ cp "$TARGET" "$INITRD_DIR/bin/openvmm_hcl"
 chmod 755 "$INITRD_DIR/bin/openvmm_hcl"
 ln -s /bin/openvmm_hcl "$INITRD_DIR/underhill-init"
 
-# Kernel modules — copy into staging.
-for m in pci-hyperv-intf.ko pci-hyperv.ko hv_storvsc.ko; do
-    src="/boot/modules/$m"
+# Kernel modules — copy into numbered subdirectories to preserve load
+# order (underhill_init walks /lib/modules/ sorted by name).
+# 000 = pci-hyperv-intf (infrastructure, must load first)
+# 001 = pci-hyperv       (depends on intf)
+# 999 = hv_storvsc       (storage, slow to probe, loads last)
+cp_module() {
+    src="/boot/modules/$2"
     if [ -f "$src" ]; then
-        cp "$src" "$INITRD_DIR/lib/modules/$m"
+        cp "$src" "$INITRD_DIR/lib/modules/$1/$2"
     else
         echo "[KEXEC-PREPARE] WARN missing $src" >&2
     fi
-done
+}
+cp_module 000 pci-hyperv-intf.ko
+cp_module 001 pci-hyperv.ko
+cp_module 999 hv_storvsc.ko
 
 # --- Build compressed initramfs ------------------------------------------
 # Use gzip -1 (fast) to keep the initrd small — the kernel needs memory for
