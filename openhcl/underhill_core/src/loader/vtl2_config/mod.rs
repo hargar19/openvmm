@@ -386,7 +386,7 @@ pub fn read_servicing_state_from_persisted(
         "servicing state region in header does not match device tree"
     );
 
-    tracing::info!(
+    tracing::debug!(
         CVM_ALLOWED,
         payload_len = header.servicing_state_payload_len,
         "reading servicing state from persisted region"
@@ -416,7 +416,7 @@ pub fn read_servicing_state_from_persisted(
         .write_at(0, &vec![0u8; header.servicing_state_payload_len as usize])
         .context("failed to zero servicing state region")?;
 
-    tracing::info!(
+    tracing::debug!(
         CVM_ALLOWED,
         payload_len = buf.len(),
         "successfully read and cleared persisted servicing state"
@@ -540,8 +540,13 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
         )
     };
 
-    for line in &bootshim_logs {
-        tracing::info!(CVM_ALLOWED, line, "openhcl_boot log");
+    // After a kexec boot these are stale first-boot logs; skip the serial
+    // replay to save ~250ms of serial I/O. The logs are still available via
+    // the inspect interface on RuntimeParameters.bootshim_logs.
+    if std::env::var_os("OPENHCL_KEXEC_SERVICING").is_none() {
+        for line in &bootshim_logs {
+            tracing::info!(CVM_ALLOWED, line, "openhcl_boot log");
+        }
     }
 
     let accepted_regions = if parsed_openhcl_boot.isolation != IsolationType::None {
@@ -563,7 +568,7 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
     // be 0. This is expected and we treat it as having no measured config.
     // Any other non-matching magic indicates corruption and should still panic.
     let vtom_offset_bit = if measured_config.magic == 0 {
-        tracing::info!(
+        tracing::debug!(
             CVM_ALLOWED,
             "measured vtl2 config magic is zero (kexec boot), using defaults"
         );
