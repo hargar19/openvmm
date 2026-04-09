@@ -93,6 +93,7 @@ pub struct ServiceVtl2Params {
     pub igvm: Option<String>,
     pub nvme_keepalive: bool,
     pub mana_keepalive: bool,
+    pub kexec: bool,
 }
 
 /// Events sent from the VmController to the REPL.
@@ -538,7 +539,17 @@ impl VmController {
 
     async fn handle_service_vtl2(&self, params: ServiceVtl2Params) -> anyhow::Result<u64> {
         let start;
-        if params.user_mode_only {
+        if params.kexec {
+            start = Instant::now();
+            openvmm_helpers::underhill::kexec_service_underhill(
+                self.ged_rpc.as_ref().context("no GED")?,
+                GuestServicingFlags {
+                    nvme_keepalive: params.nvme_keepalive,
+                    mana_keepalive: params.mana_keepalive,
+                },
+            )
+            .await?;
+        } else if params.user_mode_only {
             start = Instant::now();
             self.paravisor_diag
                 .as_ref()

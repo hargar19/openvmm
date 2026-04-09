@@ -64,3 +64,32 @@ pub async fn restore_underhill(
 
     Ok(())
 }
+
+/// Kexec-based servicing: trigger the guest to save state and kexec internally.
+///
+/// Unlike normal servicing, no IGVM staging or host-driven reload is performed.
+/// The guest saves state to a persisted memory region, then does `kexec -e` to
+/// boot the new kernel. The new VTL2 instance reads the persisted state directly
+/// from memory — no state flows through the host.
+pub async fn kexec_service_underhill(
+    send: &mesh::Sender<GuestEmulationRequest>,
+    flags: GuestServicingFlags,
+) -> anyhow::Result<()> {
+    // Fire-and-forget: send a save notification to trigger the guest-side
+    // servicing + kexec flow. The guest will serialize state, persist it to
+    // the reserved memory region, and exec into the new kernel. It will never
+    // send state back to the host, so we use Rpc::detached() to avoid waiting.
+    tracing::info!("kexec: sending save notification to trigger guest-side kexec");
+    send.send(GuestEmulationRequest::SaveGuestVtl2State(
+        mesh::rpc::Rpc::detached(flags),
+    ));
+
+    // Wait for the new VTL2 instance (booted via kexec) to report VTL0 started.
+    tracing::info!("kexec: waiting for new VTL2 to report VTL0 started");
+    send.call_failable(GuestEmulationRequest::WaitForVtl0Start, ())
+        .await
+        .context("kexec: new VTL2 failed to start VTL0")?;
+
+    tracing::info!("kexec: servicing complete — new VTL2 is running");
+    Ok(())
+}
