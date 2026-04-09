@@ -285,6 +285,11 @@ enum InteractiveCommand {
         /// Default is `false`.
         #[clap(long)]
         mana_keepalive: bool,
+        /// Use kexec-based servicing. The guest saves state to persisted
+        /// memory and does kexec internally. No IGVM staging or host-driven
+        /// reload is performed.
+        #[clap(long, conflicts_with_all(&["user_mode_only", "igvm"]))]
+        kexec: bool,
     },
 
     /// Read guest memory
@@ -1367,6 +1372,7 @@ pub(crate) async fn run_repl(
                 igvm,
                 mana_keepalive,
                 nvme_keepalive,
+                kexec,
             } => {
                 let vm_controller = vm_controller.clone();
                 let r = async move {
@@ -1378,6 +1384,7 @@ pub(crate) async fn run_repl(
                                 igvm: igvm.map(|p| p.to_string_lossy().into_owned()),
                                 nvme_keepalive,
                                 mana_keepalive,
+                                kexec,
                             },
                         )
                         .await??;
