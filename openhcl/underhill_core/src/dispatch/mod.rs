@@ -226,7 +226,11 @@ impl LoadedVm {
 
         // Background kexec pre-load: build the initramfs and stage the kernel
         // in kexec memory so that servicing only needs `kexec -e`.
-        let _kexec_preload_task = if std::env::var_os("OPENHCL_SERVICING_RESTART_VIA_KEXEC").is_some() {
+        // Skip after a kexec boot—the kexec'd initramfs lacks modules and the
+        // kexec binary, so pre-loading would just produce noisy warnings.
+        let _kexec_preload_task = if std::env::var_os("OPENHCL_SERVICING_RESTART_VIA_KEXEC").is_some()
+            && std::env::var_os("OPENHCL_KEXEC_SERVICING").is_none()
+        {
             Some(threadpool.spawn("kexec-preload", async move {
                 tracing::info!(CVM_ALLOWED, "starting background kexec pre-load");
 
