@@ -2083,16 +2083,19 @@ async fn new_underhill_vm(
     let highest_vtl_gm = gm.vtl1().unwrap_or(gm.vtl0());
 
     // Perform a quick validation to make sure each range is appropriately
-    // accessible.
-    guest_memory_access_self_test(
-        &mem_layout,
-        is_restoring,
-        proto_partition.create_partition_available(),
-        highest_vtl_gm,
-        &shared_pool,
-        vtom,
-    )
-    .context("guest memory access self test failed")?;
+    // accessible. Skip after kexec — the partition is never torn down so
+    // memory mappings are unchanged from the previous instance.
+    if std::env::var_os("OPENHCL_KEXEC_SERVICING").is_none() {
+        guest_memory_access_self_test(
+            &mem_layout,
+            is_restoring,
+            proto_partition.create_partition_available(),
+            highest_vtl_gm,
+            &shared_pool,
+            vtom,
+        )
+        .context("guest memory access self test failed")?;
+    }
 
     // Set the gpa allocator to GET that is required by the attestation message.
     get_client.set_gpa_allocator(
