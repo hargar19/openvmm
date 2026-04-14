@@ -1682,7 +1682,7 @@ impl<'a> UhProtoPartition<'a> {
         // During kexec-based servicing, skip sidecar to match the original
         // servicing behavior where openhcl_boot disables sidecar on reload.
         let sidecar = if params.skip_sidecar {
-            tracing::info!("skipping sidecar initialization (kexec servicing)");
+            tracing::debug!("skipping sidecar initialization (kexec servicing)");
             None
         } else {
             sidecar_client::SidecarClient::new(driver).map_err(Error::Sidecar)?
