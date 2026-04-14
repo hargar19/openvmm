@@ -522,7 +522,7 @@ impl UnderhillVmWorker {
             // the persisted memory region first. This avoids a round-trip to
             // the host and works even when the host is not primed with state.
             if kexec_servicing {
-                tracing::info!(
+                tracing::debug!(
                     CVM_ALLOWED,
                     "kexec servicing: attempting to read persisted servicing state"
                 );
@@ -536,7 +536,7 @@ impl UnderhillVmWorker {
                             mesh::payload::decode(&saved_state_buf)
                                 .context("failed to decode persisted servicing state")?,
                         );
-                        tracing::info!(
+                        tracing::debug!(
                             CVM_ALLOWED,
                             saved_state_len = saved_state_buf.len(),
                             "restored servicing state from persisted memory"
@@ -3571,7 +3571,7 @@ async fn new_underhill_vm(
     // behavior where openhcl_boot disables sidecar and all CPUs boot via SMP.
     if kexec_servicing {
         let vp_count = processor_topology.vp_count();
-        tracing::info!(
+        tracing::debug!(
             CVM_ALLOWED,
             vp_count,
             "kexec servicing: onlining all CPUs to match original servicing behavior"
