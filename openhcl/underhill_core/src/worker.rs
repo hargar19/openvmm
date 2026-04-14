@@ -367,10 +367,57 @@ impl Worker for UnderhillVmWorker {
 
     fn new(params: Self::Parameters) -> anyhow::Result<Self> {
         pal_async::local::block_with_io(async |driver| {
-            let (get_infra, get_watchdog_task) = construct_get().await?;
+            // For kexec servicing, read persisted state while GET version
+            // negotiation runs in the background. This overlaps ~50-100ms
+            // of vmbus round-trip with the local memory read + decode.
+            let kexec_servicing = std::env::var_os("OPENHCL_KEXEC_SERVICING").is_some();
+
+            // Start GET negotiation (vmbus round-trip begins immediately).
+            let get_future = construct_get();
+
+            let (early_servicing_state, get_infra, get_watchdog_task) = if kexec_servicing {
+                let mut get_future = std::pin::pin!(get_future);
+
+                // Read and decode persisted servicing state while GET negotiates.
+                let early_state = match bootloader_fdt_parser::ParsedBootDtInfo::new()
+                    .and_then(|parsed| {
+                        crate::loader::vtl2_config::read_servicing_state_from_persisted(&parsed)
+                    }) {
+                    Ok(Some(saved_state_buf)) => {
+                        match mesh::payload::decode::<ServicingState>(&saved_state_buf) {
+                            Ok(state) => {
+                                tracing::debug!(
+                                    CVM_ALLOWED,
+                                    saved_state_len = saved_state_buf.len(),
+                                    "kexec: restored servicing state before GET completed"
+                                );
+                                Some(state)
+                            }
+                            Err(err) => {
+                                tracing::warn!(
+                                    CVM_ALLOWED,
+                                    error = &err as &dyn std::error::Error,
+                                    "kexec: failed to decode early persisted state"
+                                );
+                                None
+                            }
+                        }
+                    }
+                    _ => None,
+                };
+
+                let (infra, task) = (&mut get_future).await?;
+                (early_state, infra, task)
+            } else {
+                let (infra, task) = get_future.await?;
+                (None, infra, task)
+            };
+
             let get_client = get_infra.get_client.clone();
 
-            let result = Self::new_or_restart(get_infra, params, true, None, driver).await;
+            let result = Self::new_or_restart(
+                get_infra, params, true, early_servicing_state, driver,
+            ).await;
 
             if let Err(err) = &result {
                 tracing::error!(
@@ -505,11 +552,7 @@ impl UnderhillVmWorker {
         let kexec_servicing = std::env::var_os("OPENHCL_KEXEC_SERVICING").is_some();
         let mut restored_state_from_host = false;
 
-        if servicing_state_from_host || kexec_servicing {
-            assert!(
-                servicing_state.is_none(),
-                "cannot have saved state from two different sources"
-            );
+        if (servicing_state_from_host || kexec_servicing) && servicing_state.is_none() {
 
             if let Some(TestScenarioConfig::RestoreStuck) = params.env_cfg.test_configuration {
                 tracing::info!(
@@ -518,10 +561,10 @@ impl UnderhillVmWorker {
                 future::pending::<()>().await;
             }
 
-            // For kexec-based servicing, try to read the servicing state from
-            // the persisted memory region first. This avoids a round-trip to
-            // the host and works even when the host is not primed with state.
-            if kexec_servicing {
+            // For kexec-based servicing, the persisted state may have already
+            // been read early (in Worker::new, before GET completed). Only
+            // attempt the read here if we don't already have state.
+            if kexec_servicing && servicing_state.is_none() {
                 tracing::debug!(
                     CVM_ALLOWED,
                     "kexec servicing: attempting to read persisted servicing state"
