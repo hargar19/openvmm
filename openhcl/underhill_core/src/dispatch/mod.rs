@@ -234,52 +234,10 @@ impl LoadedVm {
             self.start(correlation_id).await;
         }
 
-        // Background kexec pre-load: build the initramfs and stage the kernel
-        // in kexec memory so that servicing only needs `kexec -e`.
-        // Skip after a kexec boot—the kexec'd initramfs lacks modules and the
-        // kexec binary, so pre-loading would just produce noisy warnings.
-        let _kexec_preload_task = if std::env::var_os("OPENHCL_SERVICING_RESTART_VIA_KEXEC").is_some()
-            && std::env::var_os("OPENHCL_KEXEC_SERVICING").is_none()
-        {
-            Some(threadpool.spawn("kexec-preload", async move {
-                tracing::info!(CVM_ALLOWED, "starting background kexec pre-load");
-
-                // Use native Rust implementation by default. If
-                // OPENHCL_KEXEC_PREPARE_SCRIPT is set, fall back to running
-                // that shell script instead (for debugging / override).
-                let result = if let Some(script) = std::env::var_os("OPENHCL_KEXEC_PREPARE_SCRIPT") {
-                    std::process::Command::new("/bin/sh")
-                        .arg(&script)
-                        .status()
-                        .map_err(anyhow::Error::from)
-                        .and_then(|s| {
-                            if s.success() {
-                                Ok(())
-                            } else {
-                                Err(anyhow::anyhow!("script exited with status: {}", s))
-                            }
-                        })
-                } else {
-                    kexec_prepare::prepare_kexec()
-                };
-
-                match result {
-                    Ok(()) => {
-                        tracing::info!(CVM_ALLOWED, "kexec pre-load completed successfully");
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            CVM_ALLOWED,
-                            error = format!("{err:#}").as_str(),
-                            "kexec pre-load failed; \
-                             servicing will fall back to inline build"
-                        );
-                    }
-                }
-            }))
-        } else {
-            None
-        };
+        // Note: kexec pre-load (`kexec -l`) is deferred to servicing time
+        // rather than running at boot.  This avoids wasting CPU/IO when
+        // servicing may never be triggered, and allows loading the latest
+        // kernel at servicing time. See `try_kexec_after_servicing()`.
 
         // VTL2 settings services
         let (device_config_send, mut device_config_recv) = mesh::channel();
@@ -646,6 +604,12 @@ impl LoadedVm {
             std::future::pending::<()>().await;
         }
 
+        // Prepare kexec (build initramfs + kexec -l) BEFORE stopping the VM.
+        // This runs while the guest is still active, so the ~780ms of kexec
+        // preparation does not contribute to blackout time.  After VM stop,
+        // only `kexec -e` (instant) is needed.
+        let kexec_prepared = self.prepare_kexec_if_enabled(correlation_id);
+
         let running = self.state_units.is_running();
         let success = match self
             .handle_servicing_inner(correlation_id, deadline, capabilities_flags)
@@ -679,7 +643,7 @@ impl LoadedVm {
                 // host to complete the save protocol.  If kexec fails (script
                 // missing, exec error, etc.), we fall through and send state
                 // normally for the host-driven reload path.
-                self.try_kexec_after_servicing(correlation_id, "pre_send", &state_buf);
+                self.try_kexec_after_servicing(correlation_id, "pre_send", &state_buf, kexec_prepared);
 
                 tracing::info!(
                     CVM_ALLOWED,
@@ -716,22 +680,63 @@ impl LoadedVm {
         Ok(success)
     }
 
+    /// Prepare kexec if the feature is enabled.  Runs BEFORE VM stop so that
+    /// the ~780ms of initramfs build + `kexec -l` does not contribute to
+    /// blackout time.  Returns `true` if the kernel is staged and ready for
+    /// `kexec -e`.
+    fn prepare_kexec_if_enabled(&self, correlation_id: Guid) -> bool {
+        let enabled = std::env::var_os("OPENHCL_SERVICING_RESTART_VIA_KEXEC").is_some();
+        if !enabled {
+            return false;
+        }
+
+        tracing::info!(
+            CVM_ALLOWED,
+            %correlation_id,
+            "preparing kexec before VM stop (guest still running)"
+        );
+
+        let prepare_result = if let Some(script) = std::env::var_os("OPENHCL_KEXEC_PREPARE_SCRIPT") {
+            std::process::Command::new("/bin/sh")
+                .arg(&script)
+                .status()
+                .map_err(anyhow::Error::from)
+                .and_then(|s| {
+                    if s.success() {
+                        Ok(())
+                    } else {
+                        Err(anyhow::anyhow!("script exited with status: {}", s))
+                    }
+                })
+        } else {
+            kexec_prepare::prepare_kexec()
+        };
+
+        match prepare_result {
+            Ok(()) => {
+                tracing::info!(CVM_ALLOWED, %correlation_id, "kexec prepare completed");
+                true
+            }
+            Err(err) => {
+                tracing::error!(
+                    CVM_ALLOWED,
+                    %correlation_id,
+                    error = format!("{err:#}").as_str(),
+                    "kexec prepare failed; will fall back to host restart after save"
+                );
+                false
+            }
+        }
+    }
+
     fn try_kexec_after_servicing(
         &self,
         correlation_id: Guid,
         phase: &'static str,
         state_buf: &[u8],
+        kexec_prepared: bool,
     ) {
-        // Keep this logic local and opt-in to avoid changing default servicing behavior.
-        let enabled = std::env::var_os("OPENHCL_SERVICING_RESTART_VIA_KEXEC").is_some();
-        tracing::info!(
-            CVM_ALLOWED,
-            %correlation_id,
-            phase,
-            enabled,
-            "kexec servicing hook evaluated"
-        );
-        if !enabled {
+        if !kexec_prepared {
             return;
         }
 
@@ -750,31 +755,15 @@ impl LoadedVm {
             return;
         }
 
-        // Fast path: if the background pre-load completed, the kernel is
-        // already staged in kexec memory.  We only need `kexec -e`.
-        let kexec_ready = Path::new("/run/kexec-ready").exists();
         let exec_script: std::ffi::OsString = std::env::var_os("OPENHCL_KEXEC_EXEC_SCRIPT")
             .unwrap_or_else(|| "/kexec/kexec_exec.sh".into());
-        let full_script: std::ffi::OsString = std::env::var_os("OPENHCL_KEXEC_SCRIPT")
-            .unwrap_or_else(|| "/kexec/kexec_test.sh".into());
-
-        let script = if kexec_ready {
-            Path::new(&exec_script)
-        } else {
-            tracing::warn!(
-                CVM_ALLOWED,
-                %correlation_id,
-                "kexec not pre-loaded; falling back to full inline build"
-            );
-            Path::new(&full_script)
-        };
+        let script = Path::new(&exec_script);
 
         tracing::info!(
             CVM_ALLOWED,
             %correlation_id,
             phase,
             script = %script.display(),
-            kexec_ready,
             "servicing save completed; attempting guest-side kexec restart"
         );
 
