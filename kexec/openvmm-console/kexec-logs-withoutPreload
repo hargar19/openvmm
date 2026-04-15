@@ -1,0 +1,266 @@
+<30>[    6.189683] underhill_core::dispatch:  INFO servicing_save_vtl2{ correlation_id=00000000-0000-0000-0000-000000000000}:  stopping VM
+<30>[    6.199359] state_unit:  INFO servicing_save_vtl2{ correlation_id=00000000-0000-0000-0000-000000000000}:state_change{ operation="stop"}:  state change complete duration=1.2906ms
+<30>[    6.218862] state_unit:  INFO servicing_save_vtl2{ correlation_id=00000000-0000-0000-0000-000000000000}:save_units:state_change{ operation="save"}:  state change complete duration=1.4382ms
+<30>[    6.237261] underhill_core::nvme_manager::manager:  INFO  nvme manager worker shutdown requested nvme_keepalive=false
+<30>[    6.245814] underhill_core:  INFO  flushing logs
+<30>[    6.249794] underhill_core::dispatch:  INFO  servicing save completed; preparing to send state to host correlation_id=00000000-0000-0000-0000-000000000000 saved_state_len=0xc51
+<30>[    6.260042] underhill_core::dispatch:  INFO  kexec servicing hook evaluated correlation_id=00000000-0000-0000-0000-000000000000 phase="pre_send" enabled=true
+<30>[    6.272342] underhill_core::loader::vtl2_config:  INFO  writing servicing state to persisted region region=MemoryRange { start: 4f356420000, end: 4f356440000 } payload_len=0xc51
+<30>[    6.286082] underhill_core::loader::vtl2_config:  INFO  persisted servicing state written successfully
+<30>[    6.292849] underhill_core::dispatch:  INFO  servicing save completed; preparing kexec correlation_id=00000000-0000-0000-0000-000000000000 phase="pre_send"
+<30>[    6.354574] underhill_core::dispatch::kexec_prepare:  INFO  read underhill binary for initramfs binary_size=0xea2fb0
+<30>[    6.579001] underhill_core::dispatch::kexec_prepare:  INFO  loading kernel with kexec -l initramfs_size=0x795d05
+<6>[    6.750894] kexec-bzImage64: kexec: preserving current DTB (size=5956 bytes)
+<6>[    6.756734] kexec-bzImage64: kexec: reserving 5956 bytes for DTB setup_data entry
+<6>[    6.762968] kexec-bzImage64: kexec: inserted DTB setup_data entry phys=0x4f35dff9460 len=5956
+<30>[    7.056251] underhill_core::dispatch:  INFO  servicing save completed; attempting guest-side kexec restart correlation_id=00000000-0000-0000-0000-000000000000 phase="pre_send" script=/kexec/kexec_exec.sh
+<6>[    7.075658] [U] ifdown: socket: Address family not supported by protocol
+<5>[    7.081568] kexec_core: Starting new kernel
+<5>[    0.000000] Linux version 6.12.52-microsoft-hcl+ (hargar@UbuntuVM-22) (gcc (Ubuntu 11.4.0-1ubuntu1~22.04.2) 11.4.0, GNU ld (GNU Binutils for Ubuntu) 2.38) #1 SMP PREEMPT_DYNAMIC Tue Apr 14 22:03:14 UTC 2026
+<6>[    0.000000] Command line: loglevel=8 log_buf_len=128K printk.time=1 console_msg_format=syslog uio_hv_generic.no_mask=1 coredump_filter=0x33 cpufreq.off=1 cpuidle.off=1 cryptomgr.notests idle=halt initcall_blacklist=init_real_mode,sbf_init lpj=3000000 no_timer_check noxsave oops=panic panic_on_warn=0 panic_print=0 panic=-1 printk.devkmsg=on reboot=t rootfstype=tmpfs sysctl.vm.compaction_proactiveness=0 tsc=reliable unknown_nmi_panic=1 vfio_pci.ids=1414:00ba vfio.enable_unsafe_noiommu_mode=1 rdinit=/underhill-init OPENHCL_NVME_VFIO=1 OPENHCL_SERVICING_RESTART_VIA_KEXEC=1 hv_storvsc.storvsc_vcpus_per_sub_channel=2048 hv_storvsc.storvsc_max_hw_queues=2 hv_storvsc.storvsc_ringbuffer_size=0x8000 MIMALLOC_ARENA_EAGER_COMMIT=0 acpi=off clearcpuid=pcid iommu=off pci=off swiotlb=1,1 console=ttyS2,115200 OPENHCL_NVME_KEEP_ALIVE=host,privatepool hv_vmbus.message_connection_id=0x4 OPENHCL_IGVM_VTL2_GPA_POOL_CONFIG=release OPENHCL_KEXEC_SERVICING=1
+<6>[    0.000000] KERNEL supported cpus:
+<6>[    0.000000]   Intel GenuineIntel
+<6>[    0.000000]   AMD AuthenticAMD
+<6>[    0.000000] Clearing CPUID bits: pcid
+<6>[    0.000000] BIOS-provided physical RAM map:
+<6>[    0.000000] BIOS-e820: [mem 0x000004f356400000-0x000004f35643ffff] reserved
+<6>[    0.000000] BIOS-e820: [mem 0x000004f356440000-0x000004f3573fffff] usable
+<6>[    0.000000] BIOS-e820: [mem 0x000004f357400000-0x000004f357419fff] reserved
+<6>[    0.000000] BIOS-e820: [mem 0x000004f35741a000-0x000004f358140fff] usable
+<6>[    0.000000] BIOS-e820: [mem 0x000004f358141000-0x000004f35816cfff] reserved
+<6>[    0.000000] BIOS-e820: [mem 0x000004f35816d000-0x000004f3581acfff] usable
+<6>[    0.000000] BIOS-e820: [mem 0x000004f3581ad000-0x000004f3581b0fff] reserved
+<6>[    0.000000] BIOS-e820: [mem 0x000004f3581b1000-0x000004f35dffffff] usable
+<6>[    0.000000] BIOS-e820: [mem 0x000004f35e000000-0x000004f35e3fffff] reserved
+<5>[    0.000000] random: crng init done
+<6>[    0.000000] software IO TLB: area num 1.
+<6>[    0.000000] NX (Execute Disable) protection: active
+<6>[    0.000000] APIC: Static calls initialized
+<7>[    0.000000] e820: update [mem 0x4f35dff9460-0x4f35dffabb3] usable ==> usable
+<7>[    0.000000] e820: update [mem 0x4f35dff93c0-0x4f35dff93cf] usable ==> usable
+<6>[    0.000000] extended physical RAM map:
+<6>[    0.000000] reserve setup_data: [mem 0x000004f356400000-0x000004f35643ffff] reserved
+<6>[    0.000000] reserve setup_data: [mem 0x000004f356440000-0x000004f3573fffff] usable
+<6>[    0.000000] reserve setup_data: [mem 0x000004f357400000-0x000004f357419fff] reserved
+<6>[    0.000000] reserve setup_data: [mem 0x000004f35741a000-0x000004f358140fff] usable
+<6>[    0.000000] reserve setup_data: [mem 0x000004f358141000-0x000004f35816cfff] reserved
+<6>[    0.000000] reserve setup_data: [mem 0x000004f35816d000-0x000004f3581acfff] usable
+<6>[    0.000000] reserve setup_data: [mem 0x000004f3581ad000-0x000004f3581b0fff] reserved
+<6>[    0.000000] reserve setup_data: [mem 0x000004f3581b1000-0x000004f35dff93bf] usable
+<6>[    0.000000] reserve setup_data: [mem 0x000004f35dff93c0-0x000004f35dff93cf] usable
+<6>[    0.000000] reserve setup_data: [mem 0x000004f35dff93d0-0x000004f35dff945f] usable
+<6>[    0.000000] reserve setup_data: [mem 0x000004f35dff9460-0x000004f35dffabb3] usable
+<6>[    0.000000] reserve setup_data: [mem 0x000004f35dffabb4-0x000004f35dffffff] usable
+<6>[    0.000000] reserve setup_data: [mem 0x000004f35e000000-0x000004f35e3fffff] reserved
+<6>[    0.000000] Hypervisor detected: Microsoft Hyper-V
+<6>[    0.000000] Hyper-V: privilege flags low 0xe6f, high 0x88020, hints 0x60e24, misc 0x6c1b0
+<6>[    0.000000] Hyper-V: LAPIC Timer Frequency: 0x1e8480
+<6>[    0.000000] Hyper-V: Using hypercall for remote TLB flush
+<6>[    0.000000] clocksource: hyperv_clocksource_tsc_page: mask: 0xffffffffffffffff max_cycles: 0x24e6a1710, max_idle_ns: 440795202120 ns
+<6>[    0.000000] clocksource: hyperv_clocksource_msr: mask: 0xffffffffffffffff max_cycles: 0x24e6a1710, max_idle_ns: 440795202120 ns
+<6>[    0.000002] Linux runs in Hyper-V Virtual Trust Level
+<6>[    0.000002] tsc: Marking TSC unstable due to running on Hyper-V
+<6>[    0.000005] tsc: Detected 1999.997 MHz processor
+<7>[    0.000010] e820: update [mem 0x00000000-0x00000fff] usable ==> reserved
+<7>[    0.000012] e820: remove [mem 0x000a0000-0x000fffff] usable
+<6>[    0.000016] last_pfn = 0x4f35e000 max_arch_pfn = 0x1000000000
+<6>[    0.000017] x86/PAT: PAT support disabled because CONFIG_X86_PAT is disabled in the kernel.
+<6>[    0.000019] x86/PAT: Configuration [0-7]: WB  WT  UC- UC  WB  WT  UC- UC
+<6>[    0.000020] x2apic: enabled by BIOS, switching to x2apic ops
+<6>[    0.000022] last_pfn = 0x0 max_arch_pfn = 0x1000000000
+<6>[    0.000026] Using GB pages for direct mapping
+<6>[    0.000516] printk: log_buf_len: 131072 bytes
+<6>[    0.000517] printk: early log buf free: 11848(72%)
+<6>[    0.000518] RAMDISK: [mem 0x4f35c86a000-0x4f35cffffff]
+<6>[    0.000539] OF: reserved mem: Reserved memory: No reserved-memory node in the DT
+<6>[    0.000624] NODE_DATA(0) allocated [mem 0x4f35df5c700-0x4f35df60f7f]
+<6>[    0.000697] Zone ranges:
+<6>[    0.000697]   DMA      empty
+<6>[    0.000698]   DMA32    empty
+<6>[    0.000699]   Normal   [mem 0x000004f356440000-0x000004f35dffffff]
+<6>[    0.000700]   Device   empty
+<6>[    0.000700] Movable zone start for each node
+<6>[    0.000701] Early memory node ranges
+<6>[    0.000701]   node   0: [mem 0x000004f356440000-0x000004f3573fffff]
+<6>[    0.000702]   node   0: [mem 0x000004f35741a000-0x000004f358140fff]
+<6>[    0.000703]   node   0: [mem 0x000004f35816d000-0x000004f3581acfff]
+<6>[    0.000703]   node   0: [mem 0x000004f3581b1000-0x000004f35dffffff]
+<6>[    0.000704] Initmem setup node 0 [mem 0x000004f356440000-0x000004f35dffffff]
+<6>[    0.020450] On node 0, zone Normal: 25664 pages in unavailable ranges
+<6>[    0.020472] On node 0, zone Normal: 26 pages in unavailable ranges
+<6>[    0.020474] On node 0, zone Normal: 44 pages in unavailable ranges
+<6>[    0.020609] On node 0, zone Normal: 4 pages in unavailable ranges
+<6>[    0.020690] On node 0, zone Normal: 8192 pages in unavailable ranges
+<6>[    0.020726] APIC: Switched APIC routing to: physical x2apic
+<6>[    0.020727] IMCR and PIC compatibility mode.
+<6>[    0.020732] TSC deadline timer available
+<6>[    0.020735] CPU topo: Max. logical packages:   1
+<6>[    0.020735] CPU topo: Max. logical dies:       1
+<6>[    0.020736] CPU topo: Max. dies per package:   1
+<6>[    0.020738] CPU topo: Max. threads per core:   1
+<6>[    0.020739] CPU topo: Num. cores per package:     1
+<6>[    0.020740] CPU topo: Num. threads per package:   1
+<6>[    0.020740] CPU topo: Allowing 1 present CPUs plus 0 hotplug CPUs
+<6>[    0.020743] Cannot find an available gap in the 32-bit address range
+<6>[    0.020744] PCI devices with unassigned 32-bit BARs may not work!
+<6>[    0.020744] [mem 0x4f35e100000-0x4f35e4fffff] available for PCI devices
+<6>[    0.020745] Booting paravirtualized kernel on Hyper-V
+<6>[    0.020748] clocksource: refined-jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 19112604462750000 ns
+<6>[    0.020753] setup_percpu: NR_CPUS:2048 nr_cpumask_bits:1 nr_cpu_ids:1 nr_node_ids:1
+<6>[    0.020978] percpu: Embedded 45 pages/cpu s144448 r8192 d31680 u2097152
+<7>[    0.020981] pcpu-alloc: s144448 r8192 d31680 u2097152 alloc=1*2097152
+<7>[    0.020983] pcpu-alloc: [0] 0
+<6>[    0.020993] Hyper-V: PV spinlocks enabled
+<6>[    0.020994] PV qspinlock hash table entries: 256 (order: 0, 4096 bytes, linear)
+<5>[    0.020996] Kernel command line: loglevel=8 log_buf_len=128K printk.time=1 console_msg_format=syslog uio_hv_generic.no_mask=1 coredump_filter=0x33 cpufreq.off=1 cpuidle.off=1 cryptomgr.notests idle=halt initcall_blacklist=init_real_mode,sbf_init lpj=3000000 no_timer_check noxsave oops=panic panic_on_warn=0 panic_print=0 panic=-1 printk.devkmsg=on reboot=t rootfstype=tmpfs sysctl.vm.compaction_proactiveness=0 tsc=reliable unknown_nmi_panic=1 vfio_pci.ids=1414:00ba vfio.enable_unsafe_noiommu_mode=1 rdinit=/underhill-init OPENHCL_NVME_VFIO=1 OPENHCL_SERVICING_RESTART_VIA_KEXEC=1 hv_storvsc.storvsc_vcpus_per_sub_channel=2048 hv_storvsc.storvsc_max_hw_queues=2 hv_storvsc.storvsc_ringbuffer_size=0x8000 MIMALLOC_ARENA_EAGER_COMMIT=0 acpi=off clearcpuid=pcid iommu=off pci=off swiotlb=1,1 console=ttyS2,115200 OPENHCL_NVME_KEEP_ALIVE=host,privatepool hv_vmbus.message_connection_id=0x4 OPENHCL_IGVM_VTL2_GPA_POOL_CONFIG=release OPENHCL_KEXEC_SERVICING=1
+<7>[    0.021040] blacklisting initcall init_real_mode
+<7>[    0.021041] blacklisting initcall sbf_init
+<5>[    0.021146] Unknown kernel command line parameters "OPENHCL_NVME_VFIO=1 OPENHCL_SERVICING_RESTART_VIA_KEXEC=1 MIMALLOC_ARENA_EAGER_COMMIT=0 acpi=off OPENHCL_NVME_KEEP_ALIVE=host,privatepool OPENHCL_IGVM_VTL2_GPA_POOL_CONFIG=release OPENHCL_KEXEC_SERVICING=1", will be passed to user space.
+<6>[    0.021168] Dentry cache hash table entries: 16384 (order: 5, 131072 bytes, linear)
+<6>[    0.021177] Inode-cache hash table entries: 8192 (order: 4, 65536 bytes, linear)
+<6>[    0.021208] Fallback order for Node 0: 0
+<6>[    0.021209] Built 1 zonelists, mobility grouping on.  Total pages: 31606
+<6>[    0.021210] Policy zone: Normal
+<6>[    0.021211] mem auto-init: stack:off, heap alloc:off, heap free:off
+<6>[    0.021573] SLUB: HWalign=64, Order=0-3, MinObjects=0, CPUs=1, Nodes=1
+<6>[    0.021749] Dynamic Preempt: none
+<6>[    0.021771] rcu: Preemptible hierarchical RCU implementation.
+<6>[    0.021772] rcu:  RCU restricting CPUs from NR_CPUS=2048 to nr_cpu_ids=1.
+<6>[    0.021773] rcu: RCU calculated value of scheduler-enlistment delay is 10 jiffies.
+<6>[    0.021773] rcu: Adjusting geometry for rcu_fanout_leaf=16, nr_cpu_ids=1
+<6>[    0.022488] Using NULL legacy PIC
+<6>[    0.022488] NR_IRQS: 131328, nr_irqs: 32, preallocated irqs: 0
+<6>[    0.022509] rcu: srcu_init: Setting srcu_struct sizes based on contention.
+<4>[    0.022510] Persistent clock returned invalid value
+<6>[    0.022773] printk: legacy console [ttyS2] enabled
+<6>[    0.521971] APIC: Switch to symmetric I/O mode setup
+<6>[    0.524807] Hyper-V: Host Build 10.0.29450.1000-1-0
+<6>[    0.528966] Hyper-V: Using IPI hypercalls
+<6>[    0.532284] APIC: send_IPI() replaced with hv_send_ipi()
+<6>[    0.535743] APIC: send_IPI_mask() replaced with hv_send_ipi_mask()
+<6>[    0.539161] APIC: send_IPI_mask_allbutself() replaced with hv_send_ipi_mask_allbutself()
+<6>[    0.543600] APIC: send_IPI_allbutself() replaced with hv_send_ipi_allbutself()
+<6>[    0.547762] APIC: send_IPI_all() replaced with hv_send_ipi_all()
+<6>[    0.551242] APIC: send_IPI_self() replaced with hv_send_ipi_self()
+<6>[    0.554770] APIC: wakeup_secondary_cpu_64() replaced with hv_vtl_wakeup_secondary_cpu()
+<6>[    0.561049] Calibrating delay loop (skipped) preset value.. 600.00 BogoMIPS (lpj=3000000)
+<6>[    0.568161] x86/cpu: User Mode Instruction Prevention (UMIP) activated
+<6>[    0.571044] Last level iTLB entries: 4KB 0, 2MB 0, 4MB 0
+<6>[    0.571044] Last level dTLB entries: 4KB 0, 2MB 0, 4MB 0, 1GB 0
+<6>[    0.571044] Spectre V1 : Vulnerable: __user pointer sanitization and usercopy barriers only; no swapgs barriers
+<6>[    0.571044] Speculative Store Bypass: Vulnerable
+<3>[    0.571044] ITS: WARNING: Spectre-v2 mitigation is off, disabling ITS
+<6>[    0.571044] ITS: Vulnerable
+<6>[    0.571044] x86/fpu: x87 FPU will use FXSAVE
+<6>[    0.571044] Freeing SMP alternatives memory: 20K
+<6>[    0.571044] pid_max: default: 32768 minimum: 301
+<6>[    0.571044] Mount-cache hash table entries: 512 (order: 0, 4096 bytes, linear)
+<6>[    0.571044] Mountpoint-cache hash table entries: 512 (order: 0, 4096 bytes, linear)
+<6>[    0.571044] smpboot: CPU0: Intel(R) Xeon(R) Platinum 8460Y+ (family: 0x6, model: 0x8f, stepping: 0x8)
+<6>[    0.571044] Performance Events: unsupported p6 CPU model 143 no PMU driver, software events only.
+<6>[    0.571052] signal: max sigframe size: 1040
+<6>[    0.575486] rcu: Hierarchical SRCU implementation.
+<6>[    0.579816] rcu:  Max phase no-delay instances is 1000.
+<6>[    0.581118] smp: Bringing up secondary CPUs ...
+<6>[    0.584082] smp: Brought up 1 node, 1 CPU
+<6>[    0.586798] smpboot: Total of 1 processors activated (600.00 BogoMIPS)
+<6>[    0.590449] Memory: 99968K/126424K available (4609K kernel code, 468K rwdata, 1596K rodata, 1332K init, 2232K bss, 25276K reserved, 0K cma-reserved)
+<6>[    0.591121] devtmpfs: initialized
+<6>[    0.593200] x86/mm: Memory block size: 128MB
+<6>[    0.596226] clocksource: jiffies: mask: 0xffffffff max_cycles: 0xffffffff, max_idle_ns: 19112604462750000 ns
+<6>[    0.601052] futex hash table entries: 256 (order: 2, 16384 bytes, linear)
+<6>[    0.604851] NET: Registered PF_NETLINK/PF_ROUTE protocol family
+<7>[    0.608557] initcall sbf_init blacklisted
+<6>[    0.611034] PCI: Fatal: No config space access function found
+<6>[    0.611353] iommu: Default domain type: Translated
+<6>[    0.614076] iommu: DMA domain TLB invalidation policy: lazy mode
+<5>[    0.617501] SCSI subsystem initialized
+<6>[    0.619673] hv_vmbus: VMBus is present in DeviceTree
+<6>[    0.621241] hv_vmbus: Vmbus version:5.3
+<6>[    0.623618] PCI: System does not support PCI
+<6>[    0.623762] clocksource: Switched to clocksource hyperv_clocksource_tsc_page
+<6>[    0.628462] NET: Registered PF_UNIX/PF_LOCAL protocol family
+<6>[    0.630247] Unpacking initramfs...
+<6>[    0.632610] workingset: timestamp_bits=56 max_order=15 bucket_order=0
+<6>[    0.636268] io scheduler mq-deadline registered
+<6>[    0.639140] Serial: 8250/16550 driver, 4 ports, IRQ sharing enabled
+<6>[    0.653169] serial8250: ttyS0 at I/O 0x3f8 (irq = 4, base_baud = 115200) is a 16550A
+<6>[    0.694150] serial8250: ttyS1 at I/O 0x2f8 (irq = 3, base_baud = 115200) is a 16550A
+<6>[    0.732302] serial8250: ttyS2 at I/O 0x3e8 (irq = 4, base_baud = 115200) is a 16550A
+<6>[    0.752027] hv_vmbus: registering driver uio_hv_generic
+<6>[    0.761307] VFIO - User Level meta-driver version: 0.3
+<6>[    0.765862] vfio_pci: add [1414:00ba[ffffffff:ffffffff]] class 0x000000/00000000
+<6>[    0.781703] not using the register page
+<6>[    0.781950] NET: Registered PF_VSOCK protocol family
+<6>[    0.789341] hv_vmbus: registering driver hv_sock
+<6>[    0.793280] IPI shorthand broadcast: enabled
+<6>[    0.797232] sched_clock: Marking stable (232139900, 561044700)->(883651200, -90466600)
+<6>[    0.831815] Demotion targets for Node 0: null
+<6>[    0.841236] clk: Disabling unused clocks
+<6>[    0.852948] Freeing initrd memory: 7768K
+<6>[    0.856939] Freeing unused kernel image (initmem) memory: 1332K
+<6>[    0.862224] Write protecting the kernel read-only data: 8192k
+<6>[    0.867846] Freeing unused kernel image (text/rodata gap) memory: 1532K
+<6>[    0.872064] Freeing unused kernel image (rodata/data gap) memory: 452K
+<6>[    0.876148] Freeing unused kernel image (bss_decrypted gap) memory: 1976K
+<6>[    0.901054] Run /underhill-init as init process
+<7>[    0.904130]   with arguments:
+<7>[    0.906195]     /underhill-init
+<7>[    0.908322]   with environment:
+<7>[    0.910187]     HOME=/
+<7>[    0.912039]     TERM=linux
+<7>[    0.914697]     OPENHCL_NVME_VFIO=1
+<7>[    0.917304]     OPENHCL_SERVICING_RESTART_VIA_KEXEC=1
+<7>[    0.920131]     MIMALLOC_ARENA_EAGER_COMMIT=0
+<7>[    0.923609]     acpi=off
+<7>[    0.925898]     OPENHCL_NVME_KEEP_ALIVE=host,privatepool
+<7>[    0.928879]     OPENHCL_IGVM_VTL2_GPA_POOL_CONFIG=release
+<7>[    0.932710]     OPENHCL_KEXEC_SERVICING=1
+<21>[    0.937695] underhill_init: Initial process: crate_name=underhill_init, crate_revision=6261fbe26f397a899fb6c70052e219554f844bd9, crate_branch=user/hargar/kexec-2026
+<21>[    0.949301] underhill_init: Mounting filesystems
+<21>[    0.952646] underhill_init: Command line args: Options { setup_script: [], underhill_args: [] }
+<21>[    0.958484] underhill_init: Setting system resource limits and parameters
+<21>[    0.963127] underhill_init: Using 64 bytes of entropy from the host
+<21>[    0.966730] underhill_init: registered vfio-pci as driver for nvme
+<21>[    0.970445] underhill_init: loading kernel module /lib/modules/000/pci-hyperv-intf.ko:
+<21>[    0.974870] underhill_init: running KERNEL_BOOT_TIME="376613000" "/bin/openvmm_hcl" "--pid" "/run/underhill.pid"
+<21>[    0.982424] underhill_init: load complete for /lib/modules/000/pci-hyperv-intf.ko
+<21>[    0.988394] underhill_init: loading kernel module /lib/modules/001/pci-hyperv.ko:
+<30>[    0.996329] underhill_core:  INFO  VMM process crate_name="build_info" crate_revision="6261fbe26f397a899fb6c70052e219554f844bd9"
+<6>[    1.006975] hv_vmbus: registering driver hv_pci
+<21>[    1.013723] underhill_init: load complete for /lib/modules/001/pci-hyperv.ko
+<21>[    1.018867] underhill_init: loading kernel module /lib/modules/999/hv_storvsc.ko: storvsc_vcpus_per_sub_channel=2048 storvsc_max_hw_queues=2 storvsc_ringbuffer_size=0x8000
+<30>[    1.027921] underhill_core:  INFO  boot loader times start=0xb616 end=0x15128d elapsed=133.4391ms
+<30>[    1.034193] mesh_tracing:  INFO  updated trace filter filter="info"
+<30>[    1.038472] diag_server:  INFO  control starting control_address=VmAddress(Address { cid: ffffffff, port: 1 })
+<6>[    1.046325] hv_vmbus: registering driver hv_storvsc
+<30>[    1.049164] diag_server:  INFO  data starting data_address=VmAddress(Address { cid: ffffffff, port: 2 })
+<21>[    1.055954] underhill_init: load complete for /lib/modules/999/hv_storvsc.ko
+<30>[    1.063731] mesh_tracing:  INFO  updated trace filter filter="info"
+<30>[    1.071347] guest_emulation_transport::process_loop:  INFO  [GET] version negotiated protocol=NICKEL_REV2
+<30>[    1.078878] underhill_core::worker:  INFO worker_new{ name="UnderhillWorker" action="new"}:init:  kexec servicing: attempting to read persisted servicing state
+<30>[    1.088679] underhill_core::worker:  INFO worker_new{ name="UnderhillWorker" action="new"}:init:  restored servicing state from persisted memory saved_state_len=0xc51
+<30>[    1.099111] underhill_core::worker:  INFO worker_new{ name="UnderhillWorker" action="new"}:init:init/new_underhill_vm{ correlation_id=00000000-0000-0000-0000-000000000000}:  kernel boot time kernel_boot_time_ns=0x1672a888
+<30>[    1.111762] underhill_core::worker:  INFO worker_new{ name="UnderhillWorker" action="new"}:init:init/new_underhill_vm{ correlation_id=00000000-0000-0000-0000-000000000000}:  memory allocation mode memory_allocation_mode=Host
+<30>[    1.123576] underhill_core::worker:  INFO worker_new{ name="UnderhillWorker" action="new"}:init:init/new_underhill_vm{ correlation_id=00000000-0000-0000-0000-000000000000}:  vtl2 ram vtl2_ram="0x4f356400000-0x4f35e400000"
+<30>[    1.137084] underhill_core::worker:  INFO worker_new{ name="UnderhillWorker" action="new"}:init:init/new_underhill_vm{ correlation_id=00000000-0000-0000-0000-000000000000}:  overriding dps to enable default_boot_always_attempt
+<30>[    1.148136] underhill_core::worker:  INFO worker_new{ name="UnderhillWorker" action="new"}:init:init/new_underhill_vm{ correlation_id=00000000-0000-0000-0000-000000000000}:  flush logs result duration_us=0xf90
+<30>[    1.163849] underhill_core::worker:  INFO worker_new{ name="UnderhillWorker" action="new"}:init:init/new_underhill_vm{ correlation_id=00000000-0000-0000-0000-000000000000}:  vtl0 ram vtl0_ram="0x0-0x80000000(0)"
+<30>[    1.176879] underhill_core::worker:  INFO worker_new{ name="UnderhillWorker" action="new"}:init:init/new_underhill_vm{ correlation_id=00000000-0000-0000-0000-000000000000}:  vtl0 mmio vtl0_mmio="0xf8000000-0x100000000, 0xfe0000000-0x2000000000"
+<30>[    1.191417] underhill_core::worker:  INFO worker_new{ name="UnderhillWorker" action="new"}:init:init/new_underhill_vm{ correlation_id=00000000-0000-0000-0000-000000000000}:  shared pool shared_pool=""
+<30>[    1.201946] underhill_core::worker:  INFO worker_new{ name="UnderhillWorker" action="new"}:init:init/new_underhill_vm{ correlation_id=00000000-0000-0000-0000-000000000000}:  enabling alias map alias_map=0x200000000000
+<30>[    1.213722] virt_mshv_vtl:  INFO worker_new{ name="UnderhillWorker" action="new"}:init:init/new_underhill_vm{ correlation_id=00000000-0000-0000-0000-000000000000}:  skipping sidecar initialization (kexec servicing)
+<6>[    1.225151] misc mshv_hvcall: Hypercall allow map has been set, pid 45
+<6>[    1.231301] misc mshv_hvcall: Hypercall allow map has been set, pid 45
+<30>[    1.240550] underhill_mem::init:  INFO worker_new{ name="UnderhillWorker" action="new"}:init:init/new_underhill_vm{ correlation_id=00000000-0000-0000-0000-000000000000}:  Skipping VTL 1 memory map creation
+<30>[    1.252368] openhcl_dma_manager:  INFO worker_new{ name="UnderhillWorker" action="new"}:init:init/new_underhill_vm{ correlation_id=00000000-0000-0000-0000-000000000000}:  create dma manager shared_ranges=[] private_ranges=[MemoryRange { start: 4f35e000000, end: 4f35e400000 }] vtom=0x0 isolation_type=None
+<6>[    1.269994] misc mshv_hvcall: Hypercall allow map has been set, pid 45
+<30>[    1.277871] underhill_core::dispatch::vtl2_settings_worker:  INFO worker_new{ name="UnderhillWorker" action="new"}:init:init/new_underhill_vm{ correlation_id=00000000-0000-0000-0000-000000000000}:new_initial_controllers:  Initial VTL2 settings vtl2_settings=Some(Vtl2Settings { fixed: Vtl2SettingsFixed { scsi_sub_channels: 0, io_ring_size: 100, max_bounce_buffer_pages: None }, dynamic: Vtl2SettingsDynamic { ide_controller: None, scsi_controllers: [], nic_devices: [], nvme_controllers: [] } }) config_timeout_in_seconds=0x5
+<30>[    1.305436] underhill_core::worker:  INFO worker_new{ name="UnderhillWorker" action="new"}:init:init/new_underhill_vm{ correlation_id=00000000-0000-0000-0000-000000000000}:  Not Instantiating The MCR Device
+<30>[    1.318963] underhill_core::nvme_manager::manager:  INFO worker_new{ name="UnderhillWorker" action="new"}:init:init/new_underhill_vm{ correlation_id=00000000-0000-0000-0000-000000000000}:  starting nvme manager vp_count=0x1 save_restore_supported=true saved_state=false
+<28>[    1.338446] underhill_core::worker:  WARN worker_new{ name="UnderhillWorker" action="new"}:init:init/new_underhill_vm{ correlation_id=00000000-0000-0000-0000-000000000000}:base_chipset_build:add_device{ device="pm"}:  failed to set PM timer assist error=failed to set VP register via hypercall: Invalid parameter port=None
+<30>[    1.360623] underhill_core::worker:  INFO worker_new{ name="UnderhillWorker" action="new"}:init:init/new_underhill_vm{ correlation_id=00000000-0000-0000-0000-000000000000}:  kexec servicing: onlining all CPUs to match original servicing behavior vp_count=0x1
+<30>[    1.380062] state_unit:  INFO worker_new{ name="UnderhillWorker" action="new"}:init:init/restore{ correlation_id=00000000-0000-0000-0000-000000000000}:restore_units:state_change{ operation="restore"}:  state change complete duration=1.0164ms
+<30>[    1.396646] underhill_core:  INFO  vm worker started
+<30>[    1.459490] state_unit:  INFO state_change{ operation="start"}:  state change complete duration=58.433ms
+<30>[    1.465400] underhill_core::dispatch:  INFO  resuming VM correlation_id=00000000-0000-0000-0000-000000000000 blackout_time_ms=0xa50 blackout_time="2.640136s"
