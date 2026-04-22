@@ -755,39 +755,59 @@ impl LoadedVm {
             return;
         }
 
-        let exec_script: std::ffi::OsString = std::env::var_os("OPENHCL_KEXEC_EXEC_SCRIPT")
-            .unwrap_or_else(|| "/kexec/kexec_exec.sh".into());
-        let script = Path::new(&exec_script);
+        let exec_script = std::env::var_os("OPENHCL_KEXEC_EXEC_SCRIPT");
 
-        tracing::info!(
-            CVM_ALLOWED,
-            %correlation_id,
-            phase,
-            script = %script.display(),
-            "servicing save completed; attempting guest-side kexec restart"
-        );
+        // If a custom exec script is set, use it; otherwise call
+        // kexec_reboot() directly (equivalent to `kexec -e`).
+        if let Some(script_path) = exec_script {
+            let script = Path::new(&script_path);
+            tracing::info!(
+                CVM_ALLOWED,
+                %correlation_id,
+                phase,
+                script = %script.display(),
+                "servicing save completed; attempting guest-side kexec restart via script"
+            );
 
-        if !script.exists() {
+            if !script.exists() {
+                tracing::error!(
+                    CVM_ALLOWED,
+                    %correlation_id,
+                    script = %script.display(),
+                    "kexec restart requested but script does not exist; falling back to host restart"
+                );
+                return;
+            }
+
+            // Exec replaces the current process image. If it succeeds, it never returns.
+            let err = std::process::Command::new("/bin/sh").arg(script).exec();
             tracing::error!(
                 CVM_ALLOWED,
                 %correlation_id,
+                phase,
+                error = &err as &dyn std::error::Error,
                 script = %script.display(),
-                "kexec restart requested but script does not exist; falling back to host restart"
+                "failed to exec kexec script via /bin/sh; falling back to host restart"
             );
-            return;
-        }
+        } else {
+            tracing::info!(
+                CVM_ALLOWED,
+                %correlation_id,
+                phase,
+                "servicing save completed; triggering kexec reboot"
+            );
 
-        // Exec replaces the current process image. If it succeeds, it never returns.
-        // If it returns, it is always an error.
-        let err = std::process::Command::new("/bin/sh").arg(script).exec();
-        tracing::error!(
-            CVM_ALLOWED,
-            %correlation_id,
-            phase,
-            error = &err as &dyn std::error::Error,
-            script = %script.display(),
-            "failed to exec kexec script via /bin/sh; falling back to host restart"
-        );
+            // kexec_reboot() calls reboot(LINUX_REBOOT_CMD_KEXEC).
+            // If successful, this never returns.
+            let err = kexec_sys::kexec_reboot();
+            tracing::error!(
+                CVM_ALLOWED,
+                %correlation_id,
+                phase,
+                error = &err as &dyn std::error::Error,
+                "kexec reboot failed; falling back to host restart"
+            );
+        }
     }
 
     async fn handle_servicing_inner(
