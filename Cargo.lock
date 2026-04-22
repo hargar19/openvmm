@@ -3545,6 +3545,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "kexec_sys"
+version = "0.0.0"
+dependencies = [
+ "libc",
+]
+
+[[package]]
 name = "kmsg"
 version = "0.0.0"
 dependencies = [
@@ -7996,6 +8003,7 @@ dependencies = [
  "igvm_defs",
  "input_core",
  "inspect",
+ "kexec_sys",
  "kmsg",
  "kmsg_defs",
  "kmsg_writer",

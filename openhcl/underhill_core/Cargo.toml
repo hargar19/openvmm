@@ -65,6 +65,7 @@ guest_emulation_transport.workspace = true
 ide.workspace = true
 ide_resources.workspace = true
 input_core.workspace = true
+kexec_sys.workspace = true
 kmsg_defs.workspace = true
 kmsg_writer.workspace = true
 hcl.workspace = true
