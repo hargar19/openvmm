@@ -2,13 +2,18 @@
 // Licensed under the MIT License.
 
 //! Native kexec pre-load: builds initramfs in-process and stages kernel
-//! via `kexec -l`.
+//! via the `kexec_file_load` syscall.
 //!
 //! This replaces the `kexec_prepare.sh` shell script with native Rust code
 //! that builds the cpio newc archive directly in memory, streaming it through
-//! a `gzip -1` subprocess into a temp file. The only subprocesses spawned are
-//! `gzip` (compression) and `kexec` (kernel staging) — down from ~11 process
-//! invocations in the shell script approach.
+//! a `gzip -1` subprocess into a temp file. The only subprocess spawned is
+//! `gzip` (compression) — the kernel staging uses the `kexec_file_load`
+//! syscall directly via the `kexec_sys` crate, bypassing userspace
+//! kexec-tools entirely.
+//!
+//! Using `kexec_file_load` (rather than `kexec_load` via the userspace
+//! `kexec -l` binary) is required for the future KHO (Kexec Handover)
+//! support, which hooks into the `kexec_file_load` kernel path.
 //!
 //! The cpio format implementation follows the "newc" (SVR4 with no CRC)
 //! specification as documented in the Linux kernel source:
@@ -18,11 +23,11 @@ use anyhow::Context;
 use cvm_tracing::CVM_ALLOWED;
 use std::io;
 use std::io::Write;
+use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
 
 const READY_FLAG: &str = "/run/kexec-ready";
-const KEXEC_BIN: &str = "/sbin/kexec";
 const KERNEL_IMAGE: &str = "/boot/bzImage";
 
 // File type bits (from POSIX stat.h)
@@ -50,7 +55,8 @@ const KERNEL_MODULES: &[(&str, &str)] = &[
 /// This is functionally equivalent to `kexec_prepare.sh` but eliminates
 /// the staging directory and most process spawning. The cpio archive is
 /// built in memory and streamed through `gzip -1` to a temp file, then
-/// `kexec -l` stages the kernel for a future `kexec -e`.
+/// the `kexec_file_load` syscall stages the kernel for a future
+/// `reboot(LINUX_REBOOT_CMD_KEXEC)`.
 pub fn prepare_kexec() -> anyhow::Result<()> {
     // Clean up any stale sentinel from a previous run.
     let _ = std::fs::remove_file(READY_FLAG);
@@ -70,27 +76,31 @@ pub fn prepare_kexec() -> anyhow::Result<()> {
     tracing::info!(
         CVM_ALLOWED,
         initramfs_size,
-        "loading kernel with kexec -l"
+        "loading kernel with kexec_file_load syscall"
     );
 
-    // Stage the kernel in kexec memory. After this, only `kexec -e` is
-    // needed to jump to the new kernel.
-    let status = std::process::Command::new(KEXEC_BIN)
-        .arg("-l")
-        .arg(KERNEL_IMAGE)
-        .arg(format!("--initrd={}", img_path))
-        .arg(format!("--command-line={}", cmdline))
-        .arg("--reset-vga")
-        .status()
-        .context("failed to execute kexec -l")?;
+    // Stage the kernel via the kexec_file_load syscall directly. We bypass
+    // the userspace kexec-tools binary and call the syscall via the kexec_sys
+    // crate. This is required for future KHO (Kexec Handover) support, which
+    // hooks into the kernel's kexec_file_load path.
+    let kernel_file = std::fs::File::open(KERNEL_IMAGE)
+        .with_context(|| format!("failed to open kernel image: {}", KERNEL_IMAGE))?;
+    let initrd_file = std::fs::File::open(img_path)
+        .with_context(|| format!("failed to open initrd: {}", img_path))?;
+
+    let cmdline_cstr = std::ffi::CString::new(cmdline)
+        .context("kernel command line contains null byte")?;
+
+    kexec_sys::kexec_file_load(
+        kernel_file.as_raw_fd(),
+        initrd_file.as_raw_fd(),
+        &cmdline_cstr,
+    )
+    .context("kexec_file_load syscall failed")?;
 
     // The kernel image is now staged in kernel memory by the kexec
     // subsystem, so the temp file is no longer needed.
     let _ = std::fs::remove_file(img_path);
-
-    if !status.success() {
-        anyhow::bail!("kexec -l exited with status: {}", status);
-    }
 
     // Signal that kexec is pre-loaded and ready.
     std::fs::write(READY_FLAG, b"").context("failed to write kexec-ready flag")?;
