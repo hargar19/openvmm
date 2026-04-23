@@ -14,6 +14,7 @@ members = [
   "openhcl/ohcldiag-dev",
   "openhcl/openhcl_boot",
   "openhcl/openvmm_hcl",
+  "openhcl/kexec_stub",
   "openhcl/sidecar",
   "openhcl/vmfirmwareigvm_dll",
   # tmk

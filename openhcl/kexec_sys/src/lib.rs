@@ -10,10 +10,15 @@
 
 use std::ffi::CStr;
 use std::io;
+use std::os::unix::io::FromRawFd;
+use std::os::unix::io::OwnedFd;
 use std::os::unix::io::RawFd;
 
 /// `kexec_file_load` syscall number on x86_64.
 const SYS_KEXEC_FILE_LOAD: libc::c_long = 320;
+
+/// Skip reading an initrd from the initrd_fd.
+pub const KEXEC_FILE_NO_INITRAMFS: u64 = 0x04;
 
 /// Call the `kexec_file_load(2)` syscall to stage a kernel for kexec.
 ///
@@ -23,12 +28,13 @@ const SYS_KEXEC_FILE_LOAD: libc::c_long = 320;
 ///
 /// # Arguments
 /// * `kernel_fd` - File descriptor for the kernel image (vmlinux).
-/// * `initrd_fd` - File descriptor for the initrd/initramfs.
+/// * `initrd_fd` - File descriptor for the initrd/initramfs (-1 if none).
 /// * `cmdline`   - Null-terminated kernel command line.
+/// * `flags`     - Flags (e.g. `KEXEC_FILE_NO_INITRAMFS`).
 ///
 /// # Returns
 /// `Ok(())` on success, or an `io::Error` on failure.
-pub fn kexec_file_load(kernel_fd: RawFd, initrd_fd: RawFd, cmdline: &CStr) -> io::Result<()> {
+pub fn kexec_file_load(kernel_fd: RawFd, initrd_fd: RawFd, cmdline: &CStr, flags: u64) -> io::Result<()> {
     let cmdline_bytes = cmdline.to_bytes_with_nul();
     // SAFETY: kexec_file_load is a Linux syscall. The file descriptors must
     // be valid for the duration of this call (guaranteed by the caller
@@ -41,7 +47,7 @@ pub fn kexec_file_load(kernel_fd: RawFd, initrd_fd: RawFd, cmdline: &CStr) -> io
             initrd_fd as libc::c_long,
             cmdline_bytes.len() as libc::c_ulong,
             cmdline_bytes.as_ptr() as libc::c_long,
-            0 as libc::c_ulong, // flags
+            flags as libc::c_ulong,
         )
     };
     if ret != 0 {
@@ -63,4 +69,20 @@ pub fn kexec_reboot() -> io::Error {
     }
     // If we get here, the reboot syscall failed.
     io::Error::last_os_error()
+}
+
+/// Create a `memfd` — an anonymous in-memory file descriptor.
+///
+/// Returns an `OwnedFd` that behaves like a regular file but is not backed
+/// by any filesystem. Useful for passing data to `kexec_file_load` without
+/// consuming tmpfs space.
+pub fn memfd_create(name: &CStr) -> io::Result<OwnedFd> {
+    // SAFETY: memfd_create is a Linux syscall that creates an anonymous file.
+    // The name pointer is valid for the CStr's lifetime which exceeds this call.
+    let raw_fd = unsafe { libc::memfd_create(name.as_ptr(), libc::MFD_CLOEXEC) };
+    if raw_fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: raw_fd is a valid fd just returned by memfd_create.
+    Ok(unsafe { OwnedFd::from_raw_fd(raw_fd) })
 }
