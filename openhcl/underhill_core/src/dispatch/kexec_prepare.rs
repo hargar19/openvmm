@@ -29,6 +29,11 @@ use std::path::PathBuf;
 
 const READY_FLAG: &str = "/run/kexec-ready";
 const KERNEL_IMAGE: &str = "/boot/bzImage";
+const VMLINUX_IMAGE: &str = "/boot/vmlinux";
+const KEXEC_STUB_BIN: &str = "/boot/kexec_stub.bin";
+
+/// Magic bytes at the start of the packed blob (must match kexec_stub).
+const PACK_MAGIC: &[u8; 8] = b"KXSTUB\x01\x00";
 
 // File type bits (from POSIX stat.h)
 const S_IFDIR: u32 = 0o040_000;
@@ -73,30 +78,28 @@ pub fn prepare_kexec() -> anyhow::Result<()> {
         .map(|m| m.len())
         .unwrap_or(0);
 
-    tracing::info!(
-        CVM_ALLOWED,
-        initramfs_size,
-        "loading kernel with kexec_file_load syscall"
-    );
-
-    // Stage the kernel via the kexec_file_load syscall directly. We bypass
-    // the userspace kexec-tools binary and call the syscall via the kexec_sys
-    // crate. This is required for future KHO (Kexec Handover) support, which
-    // hooks into the kernel's kexec_file_load path.
-    let kernel_file = std::fs::File::open(KERNEL_IMAGE)
-        .with_context(|| format!("failed to open kernel image: {}", KERNEL_IMAGE))?;
-    let initrd_file = std::fs::File::open(img_path)
-        .with_context(|| format!("failed to open initrd: {}", img_path))?;
-
-    let cmdline_cstr = std::ffi::CString::new(cmdline)
-        .context("kernel command line contains null byte")?;
-
-    kexec_sys::kexec_file_load(
-        kernel_file.as_raw_fd(),
-        initrd_file.as_raw_fd(),
-        &cmdline_cstr,
-    )
-    .context("kexec_file_load syscall failed")?;
+    // Try the stub-based kexec path (loads uncompressed vmlinux via a bare-metal
+    // stub). Falls back to the direct bzImage path if the stub or vmlinux are
+    // not present.
+    if Path::new(KEXEC_STUB_BIN).exists()
+        && Path::new(VMLINUX_IMAGE).exists()
+    {
+        tracing::info!(
+            CVM_ALLOWED,
+            initramfs_size,
+            "using kexec stub path with vmlinux"
+        );
+        prepare_kexec_stub(img_path, &cmdline)
+            .context("kexec stub path failed")?;
+    } else {
+        tracing::info!(
+            CVM_ALLOWED,
+            initramfs_size,
+            "using direct bzImage kexec path"
+        );
+        prepare_kexec_bzimage(img_path, &cmdline)
+            .context("direct bzImage kexec path failed")?;
+    }
 
     // The kernel image is now staged in kernel memory by the kexec
     // subsystem, so the temp file is no longer needed.
@@ -106,6 +109,213 @@ pub fn prepare_kexec() -> anyhow::Result<()> {
     std::fs::write(READY_FLAG, b"").context("failed to write kexec-ready flag")?;
 
     Ok(())
+}
+
+/// Stage kexec via the stub: build a single bzImage kernel file that contains
+/// both the stub binary and the packed blob (vmlinux + initrd), then call
+/// kexec_file_load with no separate initrd.
+///
+/// The packed blob is embedded directly in the PM kernel file (after the stub
+/// binary + BSS padding) so that it resides in VTL2 memory. This avoids the
+/// issue where kexec places a separate initrd at a low GPA that belongs to
+/// VTL0 and is inaccessible to VTL2 after kexec.
+///
+/// Uses memfd for the kernel file to avoid consuming tmpfs space. Streams
+/// vmlinux and initrd directly from their files to minimize peak memory.
+fn prepare_kexec_stub(initrd_path: &str, cmdline: &str) -> anyhow::Result<()> {
+    // Read the stub flat binary (tiny, ~14 KB).
+    let mut stub_bin = std::fs::read(KEXEC_STUB_BIN)
+        .with_context(|| format!("failed to read kexec stub: {}", KEXEC_STUB_BIN))?;
+
+    // Get file sizes for the pack header (without reading files into memory).
+    let vmlinux_size = std::fs::metadata(VMLINUX_IMAGE)
+        .with_context(|| format!("failed to stat vmlinux: {}", VMLINUX_IMAGE))?
+        .len();
+    let initrd_size = std::fs::metadata(initrd_path)
+        .with_context(|| format!("failed to stat initrd: {}", initrd_path))?
+        .len();
+
+    // The packed blob (magic + sizes + vmlinux + padding + initrd) is embedded
+    // directly in the bzImage "kernel" file, after the stub binary + BSS padding.
+    // The initrd must start at a page-aligned offset within the packed blob
+    // so the kernel's free_initrd_mem() gets a page-aligned address.
+    let pack_header_size = PACK_MAGIC.len() + 8 + 8; // magic + vmlinux_size + initrd_size
+    let vmlinux_padded_end = (pack_header_size + vmlinux_size as usize + 0xFFF) & !0xFFF;
+    let packed_blob_size = vmlinux_padded_end + initrd_size as usize;
+
+    // pack_start: offset in PM kernel where packed blob begins.
+    // Must be past stub file data + BSS + page tables (allocated at runtime
+    // from memory past _end). 64 KB headroom past stub binary covers BSS,
+    // the runtime page tables, and alignment.
+    let pack_start = (0x200 + stub_bin.len() + 64 * 1024 + 0xFFF) & !0xFFF;
+
+    // init_size: total memory the kexec loader must allocate for the PM kernel.
+    let init_size = (pack_start + packed_blob_size + 0xFFF) & !0xFFF;
+
+    // Patch the stub binary with pack offset and size.
+    // entry.S places pack_offset at byte 8 and pack_size at byte 16 within
+    // the flat binary (after a jmp instruction that skips over them).
+    anyhow::ensure!(stub_bin.len() >= 24, "stub binary too small for pack info header");
+    stub_bin[8..16].copy_from_slice(&(pack_start as u64).to_le_bytes());
+    stub_bin[16..24].copy_from_slice(&(packed_blob_size as u64).to_le_bytes());
+
+    tracing::info!(
+        CVM_ALLOWED,
+        stub_size = stub_bin.len(),
+        vmlinux_size,
+        initrd_size,
+        pack_start,
+        init_size,
+        "constructing kexec stub bzImage with embedded packed blob"
+    );
+
+    // Build the 1024-byte bzImage header.
+    let header = construct_bzimage_header(init_size);
+
+    // Stream everything into a single memfd:
+    //   [header:1024][startup_32:0x200][stub_bin][zero padding to pack_start][packed blob]
+    let cname = std::ffi::CString::new("kexec_bzimage").unwrap();
+    let fd = kexec_sys::memfd_create(&cname)
+        .context("memfd_create failed for bzImage")?;
+    let mut memfd = std::fs::File::from(fd);
+
+    // 1. Write the 1024-byte bzImage header.
+    memfd.write_all(&header).context("failed to write bzImage header")?;
+
+    // 2. Write 0x200 bytes startup_32 padding.
+    memfd.write_all(&[0u8; 0x200]).context("failed to write startup_32 padding")?;
+
+    // 3. Write the stub binary.
+    memfd.write_all(&stub_bin).context("failed to write stub binary")?;
+
+    // 4. Zero-pad from current PM offset to pack_start.
+    let current_pm_offset = 0x200 + stub_bin.len();
+    let padding_size = pack_start - current_pm_offset;
+    let zero_buf = [0u8; 4096];
+    let mut remaining = padding_size;
+    while remaining > 0 {
+        let chunk = remaining.min(zero_buf.len());
+        memfd.write_all(&zero_buf[..chunk]).context("failed to write padding")?;
+        remaining -= chunk;
+    }
+
+    // 5. Write pack header: [magic:8][vmlinux_size:8][initrd_size:8]
+    memfd.write_all(PACK_MAGIC).context("failed to write pack magic")?;
+    memfd.write_all(&vmlinux_size.to_le_bytes()).context("failed to write vmlinux size")?;
+    memfd.write_all(&initrd_size.to_le_bytes()).context("failed to write initrd size")?;
+
+    // 6. Stream vmlinux from file to memfd.
+    let mut vmlinux_file = std::fs::File::open(VMLINUX_IMAGE)
+        .with_context(|| format!("failed to open vmlinux: {}", VMLINUX_IMAGE))?;
+    io::copy(&mut vmlinux_file, &mut memfd).context("failed to copy vmlinux to memfd")?;
+    drop(vmlinux_file);
+
+    // 7. Pad after vmlinux to page-align the initrd start.
+    let vmlinux_end_offset = pack_header_size + vmlinux_size as usize;
+    let initrd_pad = vmlinux_padded_end - vmlinux_end_offset;
+    if initrd_pad > 0 {
+        let pad_buf = [0u8; 4096];
+        let mut pad_remaining = initrd_pad;
+        while pad_remaining > 0 {
+            let chunk = pad_remaining.min(pad_buf.len());
+            memfd.write_all(&pad_buf[..chunk]).context("failed to write initrd padding")?;
+            pad_remaining -= chunk;
+        }
+    }
+
+    // 8. Stream initrd from file to memfd.
+    let mut initrd_file = std::fs::File::open(initrd_path)
+        .with_context(|| format!("failed to open initrd: {}", initrd_path))?;
+    io::copy(&mut initrd_file, &mut memfd).context("failed to copy initrd to memfd")?;
+    drop(initrd_file);
+
+    // Seek back to start for kexec_file_load.
+    io::Seek::seek(&mut memfd, io::SeekFrom::Start(0))
+        .context("failed to seek bzImage memfd")?;
+    let bzimage_fd = std::os::unix::io::OwnedFd::from(memfd);
+
+    let cmdline_cstr = std::ffi::CString::new(cmdline.to_owned())
+        .context("kernel command line contains null byte")?;
+
+    // Stage via kexec_file_load. No separate initrd — the packed blob is
+    // embedded in the kernel file and the stub finds it via payload_offset.
+    kexec_sys::kexec_file_load(
+        bzimage_fd.as_raw_fd(),
+        -1,
+        &cmdline_cstr,
+        kexec_sys::KEXEC_FILE_NO_INITRAMFS,
+    )
+    .context("kexec_file_load syscall failed (stub path)")?;
+
+    Ok(())
+}
+
+/// Stage kexec via the direct bzImage path (original approach).
+fn prepare_kexec_bzimage(initrd_path: &str, cmdline: &str) -> anyhow::Result<()> {
+    let kernel_file = std::fs::File::open(KERNEL_IMAGE)
+        .with_context(|| format!("failed to open kernel image: {}", KERNEL_IMAGE))?;
+    let initrd_file = std::fs::File::open(initrd_path)
+        .with_context(|| format!("failed to open initrd: {}", initrd_path))?;
+
+    let cmdline_cstr = std::ffi::CString::new(cmdline.to_owned())
+        .context("kernel command line contains null byte")?;
+
+    kexec_sys::kexec_file_load(
+        kernel_file.as_raw_fd(),
+        initrd_file.as_raw_fd(),
+        &cmdline_cstr,
+        0,
+    )
+    .context("kexec_file_load syscall failed")?;
+
+    Ok(())
+}
+
+/// Construct a minimal bzImage header for the stub kernel.
+///
+/// The bzImage header is 1024 bytes (setup_sects=1, so 2 sectors).
+/// After the header, the PM kernel contains: 0x200 bytes startup_32 padding,
+/// the stub binary, zero padding for BSS, and the packed blob.
+fn construct_bzimage_header(init_size: usize) -> [u8; 1024] {
+    let mut header = [0u8; 1024];
+
+    // setup_sects = 1 (header is boot sector + 1 setup sector = 1024 bytes)
+    header[0x1F1] = 1;
+
+    // boot_flag = 0xAA55
+    header[0x1FE] = 0x55;
+    header[0x1FF] = 0xAA;
+
+    // header magic = "HdrS" (0x53726448 LE)
+    header[0x202] = 0x48; // 'H'
+    header[0x203] = 0x64; // 'd'
+    header[0x204] = 0x72; // 'r'
+    header[0x205] = 0x53; // 'S'
+
+    // version = 0x020F (boot protocol 2.15)
+    header[0x206] = 0x0F;
+    header[0x207] = 0x02;
+
+    // loadflags = LOADED_HIGH (0x01)
+    header[0x211] = 0x01;
+
+    // cmdline_size = 0xFFFF (64 KB max) — at absolute offset 0x238
+    // (setup_header starts at 0x1F1, cmdline_size is at struct offset 0x47)
+    header[0x238..0x23C].copy_from_slice(&0xFFFFu32.to_le_bytes());
+
+    // kernel_alignment = 0x1000 (4 KB)
+    header[0x230..0x234].copy_from_slice(&0x1000u32.to_le_bytes());
+
+    // relocatable_kernel = 1
+    header[0x234] = 1;
+
+    // xloadflags: XLF_KERNEL_64 (0x01) | XLF_CAN_BE_LOADED_ABOVE_4G (0x02) | XLF_5LEVEL (0x10)
+    header[0x236..0x238].copy_from_slice(&0x0013u16.to_le_bytes());
+
+    // init_size: total memory for PM kernel (stub + BSS + packed blob).
+    header[0x260..0x264].copy_from_slice(&(init_size as u32).to_le_bytes());
+
+    header
 }
 
 /// Resolve the path to the underhill binary on disk.
