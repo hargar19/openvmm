@@ -8984,8 +8984,6 @@ dependencies = [
  "disk_nvme",
  "disklayer_ram",
  "firmware_pcat",
- "firmware_uefi",
- "firmware_uefi_custom_vars",
  "firmware_uefi_resources",
  "flate2",
  "framebuffer",
