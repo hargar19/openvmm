@@ -345,6 +345,16 @@ pub struct LoadInfo {
     pub bzimage_setup_header: Option<defs::setup_header>,
 }
 
+/// Information needed by a caller that manages the layout around a bzImage.
+pub(crate) struct BzImageLoadInfo {
+    /// The loaded kernel and its entry point.
+    pub kernel: KernelInfo,
+    /// The first address that is safe from the kernel decompressor.
+    pub next_available_address: u64,
+    /// The setup header that must be copied into the Linux zero page.
+    pub setup_header: defs::setup_header,
+}
+
 fn import_snp_boot_pages(
     importer: &mut impl ImageLoad<X86Register>,
     range: MemoryRange,
@@ -546,6 +556,35 @@ fn load_bzimage(
     kernel_start_address: u64,
     initrd: Option<InitrdConfig<'_>>,
 ) -> Result<LoadInfo, Error> {
+    let BzImageLoadInfo {
+        kernel,
+        next_available_address,
+        setup_header,
+    } = load_bzimage_kernel(
+        importer,
+        kernel_image,
+        kernel_start_address,
+        BootPageAcceptance::Exclusive,
+        "linux-kernel",
+    )?;
+    let initrd_info = import_initrd(initrd, next_available_address, importer)?;
+
+    Ok(LoadInfo {
+        kernel,
+        initrd: initrd_info,
+        dtb: None,
+        bzimage_setup_header: Some(setup_header),
+    })
+}
+
+/// Load a bzImage payload without placing its initrd or boot parameters.
+pub(crate) fn load_bzimage_kernel(
+    importer: &mut dyn ImageLoad<X86Register>,
+    kernel_image: &mut (impl Read + Seek),
+    kernel_start_address: u64,
+    acceptance: BootPageAcceptance,
+    tag: &'static str,
+) -> Result<BzImageLoadInfo, Error> {
     let info = crate::bzimage::parse_bzimage(kernel_image).map_err(Error::BzImage)?;
 
     check_address_alignment(kernel_start_address)?;
@@ -554,6 +593,15 @@ fn load_bzimage(
     let payload_len = info.protected_mode_size;
     let payload_memory_len = align_up_to_page_size(payload_len);
     let entrypoint = kernel_start_address + info.entry_offset;
+    let pref_address: u64 = info.setup_header.pref_address.into();
+    let decompressor_end = kernel_start_address
+        .max(pref_address)
+        .saturating_add(info.init_size as u64);
+    let memory_len = payload_memory_len.max(
+        decompressor_end
+            .saturating_sub(kernel_start_address)
+            .next_multiple_of(HV_PAGE_SIZE),
+    );
 
     tracing::info!(
         kernel_start_address = format_args!("{:#x}", kernel_start_address),
@@ -571,32 +619,21 @@ fn load_bzimage(
                 file_offset: payload_offset,
                 file_length: payload_len,
                 gpa: kernel_start_address,
-                memory_length: payload_memory_len,
-                acceptance: BootPageAcceptance::Exclusive,
-                tag: "linux-kernel",
+                memory_length: memory_len,
+                acceptance,
+                tag,
             },
         )
         .map_err(Error::ImportBzImage)?;
 
-    // Place initrd after the kernel's init_size region to avoid being
-    // overwritten during decompression.
-    let next_addr = kernel_start_address + payload_memory_len;
-    let pref_address: u64 = info.setup_header.pref_address.into();
-    let init_end = kernel_start_address
-        .max(pref_address)
-        .saturating_add(info.init_size as u64);
-    let next_addr = next_addr.max(init_end);
-    let initrd_info = import_initrd(initrd, next_addr, importer)?;
-
-    Ok(LoadInfo {
+    Ok(BzImageLoadInfo {
         kernel: KernelInfo {
             gpa: kernel_start_address,
-            size: payload_memory_len,
+            size: memory_len,
             entrypoint,
         },
-        initrd: initrd_info,
-        dtb: None,
-        bzimage_setup_header: Some(info.setup_header),
+        next_available_address: kernel_start_address + memory_len,
+        setup_header: info.setup_header,
     })
 }
 
@@ -1419,6 +1456,61 @@ mod tests {
         fn set_imported_regions_config_page(&mut self, _page_base: u64) {
             unimplemented!()
         }
+    }
+
+    #[test]
+    fn bzimage_kernel_reserves_decompressor_region() {
+        let setup_sects = 1u8;
+        let payload_offset = (setup_sects as usize + 1) * 512;
+        let payload_len = 1024usize;
+        let init_size = 32 * MB as u32;
+        let mut image = vec![0u8; payload_offset + payload_len];
+        image[0x1f1] = setup_sects;
+        image[0x1f4..0x1f8].copy_from_slice(&((payload_len / 16) as u32).to_le_bytes());
+        image[0x1fe..0x200].copy_from_slice(&0xaa55u16.to_le_bytes());
+        image[0x202..0x206].copy_from_slice(&0x53726448u32.to_le_bytes());
+        image[0x206..0x208].copy_from_slice(&0x020fu16.to_le_bytes());
+        image[0x211] = 1;
+        image[0x236..0x238].copy_from_slice(&1u16.to_le_bytes());
+        image[0x258..0x260].copy_from_slice(&(128 * MB).to_le_bytes());
+        image[0x260..0x264].copy_from_slice(&init_size.to_le_bytes());
+
+        let kernel_start = 132 * MB;
+        let mut importer = RecordingImporter::default();
+        let info = load_bzimage_kernel(
+            &mut importer,
+            &mut std::io::Cursor::new(image),
+            kernel_start,
+            BootPageAcceptance::Shared,
+            "underhill-kernel",
+        )
+        .unwrap();
+
+        assert_eq!(info.kernel.entrypoint, kernel_start + 0x200);
+        assert_eq!(info.next_available_address, kernel_start + init_size as u64);
+        assert_eq!(info.kernel.size, init_size as u64);
+        assert_eq!(u32::from(info.setup_header.header), 0x53726448);
+        assert!(!importer.imports.is_empty());
+        assert!(
+            importer
+                .imports
+                .iter()
+                .all(|import| import.tag == "underhill-kernel")
+        );
+        assert!(
+            importer
+                .imports
+                .iter()
+                .all(|import| import.acceptance == BootPageAcceptance::Shared)
+        );
+        assert_eq!(
+            importer
+                .imports
+                .iter()
+                .map(|import| import.page_count * HV_PAGE_SIZE)
+                .sum::<u64>(),
+            init_size as u64
+        );
     }
 
     fn test_load_info() -> LoadInfo {

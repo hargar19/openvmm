@@ -63,6 +63,7 @@ impl Options {
             .into_iter()
             .skip(i)
             .map(|x| x.to_string_lossy().into_owned())
+            .filter(|arg| !is_bootloader_only_arg(arg))
             .collect();
 
         opts
@@ -78,5 +79,20 @@ impl Options {
         }
 
         true
+    }
+}
+
+fn is_bootloader_only_arg(arg: &str) -> bool {
+    arg == "no5lvl"
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn filters_bootloader_only_arguments() {
+        assert!(is_bootloader_only_arg("no5lvl"));
+        assert!(!is_bootloader_only_arg("--pid"));
     }
 }

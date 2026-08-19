@@ -205,6 +205,10 @@ fn build_kernel_command_line(
         // TODO: remove this once we figure out the root cause and apply
         // a workaround/fix elsewhere.
         "clearcpuid=pcid",
+        // The bzImage decompressor uses a trampoline below 1 MB when switching
+        // between four- and five-level paging. OpenHCL does not map legacy low
+        // memory, so retain the four-level page tables supplied by the boot shim.
+        "no5lvl",
         // Disable all attempts to use an IOMMU, including swiotlb.
         "iommu=off",
         // Don't probe for a PCI bus. PCI devices currently come from VPCI. When
@@ -472,11 +476,15 @@ mod x86_boot {
         address_space: &AddressSpaceManager,
         initrd: Range<u64>,
         cmdline: &str,
+        kernel_setup_header: Option<&loader_defs::linux::setup_header>,
         setup_data_head: *const setup_data,
         setup_data_tail: &mut &mut setup_data,
     ) -> OffStackRef<'static, PageAlign<boot_params>> {
         let mut boot_params_storage = off_stack!(PageAlign<boot_params>, zeroed());
         let boot_params = &mut boot_params_storage.0;
+        if let Some(kernel_setup_header) = kernel_setup_header {
+            boot_params.hdr = *kernel_setup_header;
+        }
         boot_params.hdr.type_of_loader = 0xff; // Unknown loader type
 
         // HACK: A kernel change just in the Underhill kernel tree has a workaround
@@ -514,6 +522,40 @@ mod x86_boot {
         boot_params.hdr.setup_data = (setup_data_head as u64).into();
 
         boot_params_storage
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        #[test]
+        fn bzimage_setup_header_is_preserved() {
+            let mut setup_header = loader_defs::linux::setup_header::new_zeroed();
+            setup_header.header = 0x53726448.into();
+            setup_header.version = 0x020f.into();
+            setup_header.xloadflags = 1.into();
+            setup_header.pref_address = 0x8000000.into();
+
+            let mut setup_data = setup_data::new_zeroed();
+            let setup_data_head = ptr::from_ref(&setup_data);
+            let mut setup_data_tail = &mut setup_data;
+            let boot_params = build_boot_params(
+                &AddressSpaceManager::new_const(),
+                0x9000000..0x9100000,
+                "console=ttyS0",
+                Some(&setup_header),
+                setup_data_head,
+                &mut setup_data_tail,
+            );
+
+            assert_eq!(u32::from(boot_params.0.hdr.header), 0x53726448);
+            assert_eq!(u16::from(boot_params.0.hdr.version), 0x020f);
+            assert_eq!(u16::from(boot_params.0.hdr.xloadflags), 1);
+            assert_eq!(u64::from(boot_params.0.hdr.pref_address), 0x8000000);
+            assert_eq!(boot_params.0.hdr.type_of_loader, 0xff);
+            assert_eq!(u32::from(boot_params.0.hdr.hardware_subarch), 1);
+            assert_eq!(u32::from(boot_params.0.hdr.ramdisk_image), 0x9000000);
+        }
     }
 }
 
@@ -816,6 +858,7 @@ fn shim_main(shim_params_raw_offset: isize) -> ! {
         address_space,
         initrd.clone(),
         &cmdline,
+        p.kernel_setup_header.as_ref(),
         setup_data_head,
         &mut setup_data_tail,
     );

@@ -56,9 +56,18 @@ Every time the kernel needs to be rebuilt:
 ./Microsoft/build-hcl-kernel.sh
 ```
 
-The output directory is `./out`, it contains the kernel binary, the kernel modules,
-and the debug symbols, and `cargo xflowey build-igvm` can be pointed to it to use
-as a source of the kernel binary and the modules.
+The output directory is `./out`. It contains the kernel binary, kernel modules,
+and debug symbols. On x64, the kernel build also produces the compressed image
+at `../build/linux/arch/x86/boot/bzImage`. Copy it beside the packaged
+`vmlinux` and metadata before passing it to `cargo xflowey build-igvm`:
+
+```bash
+cp ../build/linux/arch/x86/boot/bzImage \
+	out/build/native/bin/x64/bzImage
+cargo xflowey build-igvm x64 \
+	--custom-kernel out/build/native/bin/x64/bzImage \
+	--custom-kernel-modules out/build/native/bin/x64/modules
+```
 
 In the case you are iterating on a change, install [`ccache`](https://ccache.dev/)
 for decreasing the kernel build time significantly, might be close to an order of

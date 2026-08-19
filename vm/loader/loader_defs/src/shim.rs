@@ -17,6 +17,10 @@ use zerocopy::KnownLayout;
 pub struct ShimParamsRaw {
     /// The offset to the Linux kernel entry point.
     pub kernel_entry_offset: i64,
+    /// The Linux setup header for a bzImage, or all zeroes for other formats.
+    pub kernel_setup_header: crate::linux::setup_header,
+    /// Explicit alignment padding.
+    pub _kernel_setup_header_padding: u8,
     /// The offset to the [`crate::paravisor::ParavisorCommandLine`] structure.
     pub cmdline_offset: i64,
     /// The offset to the initrd.

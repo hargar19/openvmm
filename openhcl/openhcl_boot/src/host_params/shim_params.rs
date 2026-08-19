@@ -78,6 +78,8 @@ pub struct ShimParams {
     // TODO: replace all of these base/size pairs with MemoryRange
     /// The kernel entry address.
     pub kernel_entry_address: u64,
+    /// The setup header when booting a bzImage.
+    pub kernel_setup_header: Option<loader_defs::linux::setup_header>,
     /// The address of the [`ParavisorCommandLine`] structure.
     pub cmdline_base: u64,
     /// The initrd address.
@@ -120,6 +122,8 @@ impl ShimParams {
     pub fn new(shim_base_address: u64, raw: &ShimParamsRaw) -> Self {
         let &ShimParamsRaw {
             kernel_entry_offset,
+            kernel_setup_header,
+            _kernel_setup_header_padding: _,
             cmdline_offset,
             initrd_offset,
             initrd_size,
@@ -145,6 +149,10 @@ impl ShimParams {
             persisted_state_region_offset,
             persisted_state_region_size,
         } = raw;
+
+        const HDRS_MAGIC: u32 = 0x53726448;
+        let kernel_setup_header =
+            (u32::from(kernel_setup_header.header) == HDRS_MAGIC).then_some(kernel_setup_header);
 
         let isolation_type = get_isolation_type(supported_isolation_type);
 
@@ -172,6 +180,7 @@ impl ShimParams {
 
         Self {
             kernel_entry_address: shim_base_address.wrapping_add_signed(kernel_entry_offset),
+            kernel_setup_header,
             cmdline_base: shim_base_address.wrapping_add_signed(cmdline_offset),
             initrd_base: shim_base_address.wrapping_add_signed(initrd_offset),
             initrd_size,

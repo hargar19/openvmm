@@ -152,12 +152,19 @@ Some examples of potentially useful customization include:
     cargo xflowey build-igvm x64 --custom-openvmm-hcl target/x86_64-unknown-linux-musl/debug/openvmm_hcl
     ```
 
-- Specify a custom VTL2 kernel `vmlinux` / `Image`, instead of using the
-    packaged main kernel.
+- Specify a custom VTL2 kernel instead of using the packaged main kernel. X64
+    accepts an uncompressed `vmlinux` ELF or a compressed `bzImage`; AArch64
+    accepts `Image`.
 
     ```bash
-    cargo xflowey build-igvm x64 --custom-kernel path/to/my/prebuilt/vmlinux
+    cargo xflowey build-igvm x64 \
+        --custom-kernel path/to/kernel-package/bzImage \
+        --custom-kernel-modules path/to/kernel-package/modules
     ```
+
+    The custom kernel must be beside `kernel_build_metadata.json`, and the
+    modules path must identify the package's `modules` directory. A compressed
+    x64 kernel is decompressed by the kernel's startup code during cold boot.
 
     The packaged dev kernel variants are disabled by default. A custom kernel
     remains available for local kernel development without enabling those

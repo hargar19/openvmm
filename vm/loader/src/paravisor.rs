@@ -297,30 +297,50 @@ where
 
     tracing::trace!(offset, "loading the kernel");
 
-    // The x86_64 uncompressed kernel we use doesn't show any difference
-    // in the code sections upon flipping CONFIG_RELOCATABLE. In total,
-    // there are 6 places where a difference is found: dates in the Linux
-    // banner, GNU build ID, and metadata entries in the empty initrd image
-    // (it always is embedded into the kernel). No sections with relocations
-    // appear if CONFIG_RELOCATABLE is set.
-    // Assume that at least the kernel entry contains PIC and no loader
-    // assistance with the relocations records (if any) is required.
-    let load_info = crate::elf::load_static_elf(
-        importer,
-        kernel_image,
-        offset,
-        0,
-        true,
-        kernel_acceptance,
-        "underhill-kernel",
-    )
-    .map_err(|e| Error::Kernel(crate::linux::Error::ElfLoader(e)))?;
-    tracing::trace!("Kernel loaded at {load_info:x?}");
-    let crate::elf::LoadInfo {
-        minimum_address_used: _min_addr,
-        next_available_address: mut offset,
-        entrypoint: kernel_entrypoint,
-    } = load_info;
+    let (kernel_entrypoint, mut offset, kernel_setup_header) =
+        if crate::bzimage::is_bzimage(kernel_image)
+            .map_err(crate::linux::Error::BzImage)
+            .map_err(Error::Kernel)?
+        {
+            let crate::linux::BzImageLoadInfo {
+                kernel,
+                next_available_address,
+                setup_header,
+            } = crate::linux::load_bzimage_kernel(
+                importer,
+                kernel_image,
+                offset,
+                kernel_acceptance,
+                "underhill-kernel",
+            )
+            .map_err(Error::Kernel)?;
+            (
+                kernel.entrypoint,
+                next_available_address,
+                Some(setup_header),
+            )
+        } else {
+            // The x86_64 uncompressed kernel we use doesn't show any difference
+            // in the code sections upon flipping CONFIG_RELOCATABLE. In total,
+            // there are 6 places where a difference is found: dates in the Linux
+            // banner, GNU build ID, and metadata entries in the empty initrd image
+            // (it always is embedded into the kernel). No sections with relocations
+            // appear if CONFIG_RELOCATABLE is set.
+            // Assume that at least the kernel entry contains PIC and no loader
+            // assistance with the relocations records (if any) is required.
+            let load_info = crate::elf::load_static_elf(
+                importer,
+                kernel_image,
+                offset,
+                0,
+                true,
+                kernel_acceptance,
+                "underhill-kernel",
+            )
+            .map_err(|e| Error::Kernel(crate::linux::Error::ElfLoader(e)))?;
+            tracing::trace!("Kernel loaded at {load_info:x?}");
+            (load_info.entrypoint, load_info.next_available_address, None)
+        };
 
     assert_eq!(offset & (HV_PAGE_SIZE - 1), 0);
 
@@ -607,6 +627,8 @@ where
     let calculate_shim_offset = |addr: u64| addr.wrapping_sub(shim_base_addr) as i64;
     let shim_params = ShimParamsRaw {
         kernel_entry_offset: calculate_shim_offset(kernel_entrypoint),
+        kernel_setup_header: kernel_setup_header.unwrap_or_else(FromZeros::new_zeroed),
+        _kernel_setup_header_padding: 0,
         cmdline_offset: calculate_shim_offset(cmdline_base),
         initrd_offset: calculate_shim_offset(initrd_base),
         initrd_size,
@@ -1267,6 +1289,8 @@ where
     let calculate_shim_offset = |addr: u64| -> i64 { addr.wrapping_sub(shim_base_addr) as i64 };
     let shim_params = ShimParamsRaw {
         kernel_entry_offset: calculate_shim_offset(kernel_entry_point),
+        kernel_setup_header: FromZeros::new_zeroed(),
+        _kernel_setup_header_padding: 0,
         cmdline_offset: calculate_shim_offset(cmdline_base),
         initrd_offset: calculate_shim_offset(initrd_gpa),
         initrd_size,

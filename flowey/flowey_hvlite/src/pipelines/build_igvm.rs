@@ -161,8 +161,8 @@ pub struct BuildIgvmCliCustomizations {
     #[clap(long)]
     pub custom_uefi: Option<PathBuf>,
 
-    /// Path to custom kernel vmlinux / Image, none means the packaged kernel
-    /// will be used.
+    /// Path to a custom kernel: vmlinux or bzImage on x64, Image on AArch64.
+    /// None means the packaged kernel will be used.
     #[clap(long)]
     pub custom_kernel: Option<PathBuf>,
 
