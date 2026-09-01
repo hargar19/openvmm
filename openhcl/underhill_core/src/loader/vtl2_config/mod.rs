@@ -327,8 +327,8 @@ pub fn write_servicing_state_to_persisted(
 
     // Write the servicing state payload.
     let ranges = [region];
-    let mapping =
-        Vtl2ParamsMap::new_writeable(&ranges).context("failed to map persisted servicing state region")?;
+    let mapping = Vtl2ParamsMap::new_writeable(&ranges)
+        .context("failed to map persisted servicing state region")?;
     mapping
         .write_at(0, state_buf)
         .context("failed to write servicing state")?;
@@ -357,8 +357,7 @@ pub fn write_servicing_state_to_persisted(
 }
 
 /// Read servicing state from the persisted servicing state region after a kexec
-/// restart. Returns `None` if no servicing state is stored. On success, the
-/// header's servicing state fields are cleared to prevent stale reads.
+/// restart. Returns `None` if no servicing state is stored.
 pub fn read_servicing_state_from_persisted(
     parsed: &ParsedBootDtInfo,
 ) -> anyhow::Result<Option<Vec<u8>>> {
@@ -414,8 +413,20 @@ pub fn read_servicing_state_from_persisted(
         .read_at(0, &mut buf)
         .context("failed to read servicing state")?;
 
-    // Clear the servicing state from the header so a subsequent non-kexec boot
-    // does not accidentally reuse stale state.
+    Ok(Some(buf))
+}
+
+/// Clear servicing state after it has been decoded successfully.
+pub fn clear_servicing_state_from_persisted(parsed: &ParsedBootDtInfo) -> anyhow::Result<()> {
+    use loader_defs::shim::PersistedStateHeader;
+
+    let header_ranges = [parsed.vtl2_persisted_header];
+    let header_mapping =
+        Vtl2ParamsMap::new_writeable(&header_ranges).context("unable to map persisted header")?;
+    let header: PersistedStateHeader = header_mapping
+        .read_plain(0)
+        .context("failed to read persisted state header")?;
+
     let cleared_header = PersistedStateHeader {
         servicing_state_base: 0,
         servicing_state_region_len: 0,
@@ -424,18 +435,19 @@ pub fn read_servicing_state_from_persisted(
     };
     header_mapping.write_at(0, cleared_header.as_bytes())?;
 
-    // Zero out the servicing state region.
-    mapping
-        .write_at(0, &vec![0u8; header.servicing_state_payload_len as usize])
-        .context("failed to zero servicing state region")?;
+    let region = parsed.vtl2_persisted_servicing_state;
+    let ranges = [region];
+    let mapping = Vtl2ParamsMap::new_writeable(&ranges)
+        .context("failed to map persisted servicing state region")?;
+    if header.servicing_state_payload_len <= region.len() {
+        mapping
+            .write_at(0, &vec![0u8; header.servicing_state_payload_len as usize])
+            .context("failed to zero servicing state region")?;
+    }
 
-    tracing::debug!(
-        CVM_ALLOWED,
-        payload_len = buf.len(),
-        "successfully read and cleared persisted servicing state"
-    );
+    tracing::debug!(CVM_ALLOWED, "cleared persisted servicing state");
 
-    Ok(Some(buf))
+    Ok(())
 }
 
 /// Reads the VTL 2 parameters from the config region and VTL2 reserved region.
@@ -553,13 +565,8 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
         )
     };
 
-    // After a kexec boot these are stale first-boot logs; skip the serial
-    // replay to save ~250ms of serial I/O. The logs are still available via
-    // the inspect interface on RuntimeParameters.bootshim_logs.
-    if std::env::var_os("OPENHCL_KEXEC_SERVICING").is_none() {
-        for line in &bootshim_logs {
-            tracing::info!(CVM_ALLOWED, line, "openhcl_boot log");
-        }
+    for line in &bootshim_logs {
+        tracing::info!(CVM_ALLOWED, line, "openhcl_boot log");
     }
 
     let accepted_regions = if parsed_openhcl_boot.isolation != IsolationType::None {
@@ -582,7 +589,8 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
     // instance's Vtl2ParamsMap drop (zero_on_drop), so the magic field will
     // be 0. This is expected and we treat it as having no measured config.
     // Any other non-matching magic indicates corruption and should still panic.
-    let has_measured_config = if measured_config.magic == 0 {
+    let kexec_servicing = std::env::var_os("OPENHCL_KEXEC_SERVICING").is_some();
+    let has_measured_config = if kexec_servicing && measured_config.magic == 0 {
         tracing::debug!(
             CVM_ALLOWED,
             "measured vtl2 config magic is zero (kexec boot), using defaults"

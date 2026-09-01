@@ -55,8 +55,6 @@ use socket2::Socket;
 use state_unit::SavedStateUnit;
 use state_unit::SpawnedUnit;
 use state_unit::StateUnits;
-use std::os::unix::process::CommandExt;
-use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 use tracing::Instrument;
@@ -604,7 +602,7 @@ impl LoadedVm {
             std::future::pending::<()>().await;
         }
 
-        // Prepare kexec (build initramfs + kexec -l) BEFORE stopping the VM.
+        // Prepare kexec (build initramfs + kexec_file_load) before stopping the VM.
         // This runs while the guest is still active, so the ~780ms of kexec
         // preparation does not contribute to blackout time.  After VM stop,
         // only `kexec -e` (instant) is needed.
@@ -643,7 +641,7 @@ impl LoadedVm {
                 // host to complete the save protocol.  If kexec fails (script
                 // missing, exec error, etc.), we fall through and send state
                 // normally for the host-driven reload path.
-                self.try_kexec_after_servicing(correlation_id, "pre_send", &state_buf, kexec_prepared);
+                self.try_kexec_after_servicing(correlation_id, &state_buf, kexec_prepared);
 
                 tracing::info!(
                     CVM_ALLOWED,
@@ -681,9 +679,8 @@ impl LoadedVm {
     }
 
     /// Prepare kexec if the feature is enabled.  Runs BEFORE VM stop so that
-    /// the ~780ms of initramfs build + `kexec -l` does not contribute to
-    /// blackout time.  Returns `true` if the kernel is staged and ready for
-    /// `kexec -e`.
+    /// the initramfs build and `kexec_file_load` do not contribute to blackout
+    /// time. Returns `true` if the kernel is staged and ready for kexec.
     fn prepare_kexec_if_enabled(&self, correlation_id: Guid) -> bool {
         let enabled = std::env::var_os("OPENHCL_SERVICING_RESTART_VIA_KEXEC").is_some();
         if !enabled {
@@ -696,21 +693,7 @@ impl LoadedVm {
             "preparing kexec before VM stop (guest still running)"
         );
 
-        let prepare_result = if let Some(script) = std::env::var_os("OPENHCL_KEXEC_PREPARE_SCRIPT") {
-            std::process::Command::new("/bin/sh")
-                .arg(&script)
-                .status()
-                .map_err(anyhow::Error::from)
-                .and_then(|s| {
-                    if s.success() {
-                        Ok(())
-                    } else {
-                        Err(anyhow::anyhow!("script exited with status: {}", s))
-                    }
-                })
-        } else {
-            kexec_prepare::prepare_kexec()
-        };
+        let prepare_result = kexec_prepare::prepare_kexec();
 
         match prepare_result {
             Ok(()) => {
@@ -732,7 +715,6 @@ impl LoadedVm {
     fn try_kexec_after_servicing(
         &self,
         correlation_id: Guid,
-        phase: &'static str,
         state_buf: &[u8],
         kexec_prepared: bool,
     ) {
@@ -743,9 +725,9 @@ impl LoadedVm {
         // Persist the servicing state into the reserved memory region so the
         // next instance can read it back without involving the host.
         let parsed = self.runtime_params.parsed_openhcl_boot();
-        if let Err(err) = crate::loader::vtl2_config::write_servicing_state_to_persisted(
-            parsed, state_buf,
-        ) {
+        if let Err(err) =
+            crate::loader::vtl2_config::write_servicing_state_to_persisted(parsed, state_buf)
+        {
             tracing::error!(
                 CVM_ALLOWED,
                 %correlation_id,
@@ -755,59 +737,21 @@ impl LoadedVm {
             return;
         }
 
-        let exec_script = std::env::var_os("OPENHCL_KEXEC_EXEC_SCRIPT");
+        tracing::info!(
+            CVM_ALLOWED,
+            %correlation_id,
+            "servicing save completed; triggering kexec reboot"
+        );
 
-        // If a custom exec script is set, use it; otherwise call
-        // kexec_reboot() directly (equivalent to `kexec -e`).
-        if let Some(script_path) = exec_script {
-            let script = Path::new(&script_path);
-            tracing::info!(
-                CVM_ALLOWED,
-                %correlation_id,
-                phase,
-                script = %script.display(),
-                "servicing save completed; attempting guest-side kexec restart via script"
-            );
-
-            if !script.exists() {
-                tracing::error!(
-                    CVM_ALLOWED,
-                    %correlation_id,
-                    script = %script.display(),
-                    "kexec restart requested but script does not exist; falling back to host restart"
-                );
-                return;
-            }
-
-            // Exec replaces the current process image. If it succeeds, it never returns.
-            let err = std::process::Command::new("/bin/sh").arg(script).exec();
-            tracing::error!(
-                CVM_ALLOWED,
-                %correlation_id,
-                phase,
-                error = &err as &dyn std::error::Error,
-                script = %script.display(),
-                "failed to exec kexec script via /bin/sh; falling back to host restart"
-            );
-        } else {
-            tracing::info!(
-                CVM_ALLOWED,
-                %correlation_id,
-                phase,
-                "servicing save completed; triggering kexec reboot"
-            );
-
-            // kexec_reboot() calls reboot(LINUX_REBOOT_CMD_KEXEC).
-            // If successful, this never returns.
-            let err = kexec_sys::kexec_reboot();
-            tracing::error!(
-                CVM_ALLOWED,
-                %correlation_id,
-                phase,
-                error = &err as &dyn std::error::Error,
-                "kexec reboot failed; falling back to host restart"
-            );
-        }
+        // kexec_reboot() calls reboot(LINUX_REBOOT_CMD_KEXEC).
+        // If successful, this never returns.
+        let err = kexec_sys::kexec_reboot();
+        tracing::error!(
+            CVM_ALLOWED,
+            %correlation_id,
+            error = &err as &dyn std::error::Error,
+            "kexec reboot failed; falling back to host restart"
+        );
     }
 
     async fn handle_servicing_inner(
