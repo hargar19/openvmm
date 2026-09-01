@@ -103,6 +103,7 @@ impl Worker {
             GuestServicingFlags {
                 nvme_keepalive: flags.enable_nvme_keepalive,
                 mana_keepalive: flags.enable_mana_keepalive,
+                kexec: false,
             },
             file,
         )

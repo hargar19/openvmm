@@ -1196,8 +1196,12 @@ pub struct SaveGuestVtl2StateFlags {
     #[bits(1)]
     pub enable_mana_keepalive: bool,
 
+    /// Request a guest-side kexec servicing boundary.
+    #[bits(1)]
+    pub enable_kexec: bool,
+
     /// Reserved, must be zero.
-    #[bits(62)]
+    #[bits(61)]
     _rsvd1: u64,
 }
 

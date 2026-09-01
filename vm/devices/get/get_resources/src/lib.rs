@@ -182,6 +182,8 @@ pub mod ged {
         pub nvme_keepalive: bool,
         /// Retain memory for MANA devices.
         pub mana_keepalive: bool,
+        /// Restart VTL2 through guest-side kexec.
+        pub kexec: bool,
     }
 
     /// Actions a client can request that the Guest Emulation
@@ -192,6 +194,8 @@ pub mod ged {
         WaitForConnect(Rpc<(), ()>),
         /// Wait for VTL2 to start VTL0.
         WaitForVtl0Start(Rpc<(), Result<(), Vtl0StartError>>),
+        /// Clear the cached VTL0 start result before waiting for a new boot.
+        ClearVtl0Start(Rpc<(), ()>),
         /// Save VTL2 state.
         SaveGuestVtl2State(Rpc<GuestServicingFlags, Result<(), SaveRestoreError>>),
         /// Update the VTL2 settings.
