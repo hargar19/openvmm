@@ -599,8 +599,9 @@ impl LoadedVm {
 
         // Build the initramfs and stage the kernel before stopping the VM so
         // preparation does not contribute to blackout time.
-        let kexec_prepared =
-            self.prepare_kexec_if_enabled(correlation_id, capabilities_flags.enable_kexec());
+        let kexec_enabled = capabilities_flags.enable_kexec()
+            || std::env::var_os("OPENHCL_SERVICING_RESTART_VIA_KEXEC").is_some();
+        let kexec_prepared = self.prepare_kexec_if_enabled(correlation_id, kexec_enabled);
 
         let running = self.state_units.is_running();
         let success = match self
