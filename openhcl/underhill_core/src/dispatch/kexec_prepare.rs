@@ -27,7 +27,6 @@ use std::os::unix::io::AsRawFd;
 use std::path::Path;
 use std::path::PathBuf;
 
-const READY_FLAG: &str = "/run/kexec-ready";
 const VMLINUX_IMAGE: &str = "/boot/vmlinux";
 
 // File type bits (from POSIX stat.h)
@@ -58,9 +57,6 @@ const KERNEL_MODULES: &[(&str, &str)] = &[
 /// the `kexec_file_load` syscall stages the kernel for a future
 /// `reboot(LINUX_REBOOT_CMD_KEXEC)`.
 pub fn prepare_kexec() -> anyhow::Result<()> {
-    // Clean up any stale sentinel from a previous run.
-    let _ = std::fs::remove_file(READY_FLAG);
-
     let binary_path = resolve_binary_path();
     let cmdline = build_cmdline().context("failed to build kernel command line")?;
 
@@ -80,9 +76,6 @@ pub fn prepare_kexec() -> anyhow::Result<()> {
     // The kernel image is now staged in kernel memory by the kexec
     // subsystem, so the temp file is no longer needed.
     let _ = std::fs::remove_file(img_path);
-
-    // Signal that kexec is pre-loaded and ready.
-    std::fs::write(READY_FLAG, b"").context("failed to write kexec-ready flag")?;
 
     Ok(())
 }
@@ -141,11 +134,6 @@ fn build_cmdline() -> anyhow::Result<String> {
 
     if !cmdline.contains("OPENHCL_KEXEC_SERVICING=") {
         cmdline.push_str(" OPENHCL_KEXEC_SERVICING=1");
-    }
-
-    if let Some(extra) = std::env::var_os("EXTRA_CMDLINE") {
-        cmdline.push(' ');
-        cmdline.push_str(&extra.to_string_lossy());
     }
 
     Ok(cmdline)

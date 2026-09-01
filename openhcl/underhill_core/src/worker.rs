@@ -382,57 +382,11 @@ impl Worker for UnderhillVmWorker {
 
     fn new(params: Self::Parameters) -> anyhow::Result<Self> {
         pal_async::local::block_with_io(async |driver| {
-            // For kexec servicing, read persisted state while GET version
-            // negotiation runs in the background. This overlaps ~50-100ms
-            // of vmbus round-trip with the local memory read + decode.
-            let kexec_servicing = std::env::var_os("OPENHCL_KEXEC_SERVICING").is_some();
-
-            // Start GET negotiation (vmbus round-trip begins immediately).
-            let get_future = construct_get();
-
-            let (early_servicing_state, get_infra, get_watchdog_task) = if kexec_servicing {
-                let mut get_future = std::pin::pin!(get_future);
-
-                // Read and decode persisted servicing state while GET negotiates.
-                let early_state = match bootloader_fdt_parser::ParsedBootDtInfo::new()
-                    .and_then(|parsed| {
-                        crate::loader::vtl2_config::read_servicing_state_from_persisted(&parsed)
-                    }) {
-                    Ok(Some(saved_state_buf)) => {
-                        match mesh::payload::decode::<ServicingState>(&saved_state_buf) {
-                            Ok(state) => {
-                                tracing::debug!(
-                                    CVM_ALLOWED,
-                                    saved_state_len = saved_state_buf.len(),
-                                    "kexec: restored servicing state before GET completed"
-                                );
-                                Some(state)
-                            }
-                            Err(err) => {
-                                tracing::warn!(
-                                    CVM_ALLOWED,
-                                    error = &err as &dyn std::error::Error,
-                                    "kexec: failed to decode early persisted state"
-                                );
-                                None
-                            }
-                        }
-                    }
-                    _ => None,
-                };
-
-                let (infra, task) = (&mut get_future).await?;
-                (early_state, infra, task)
-            } else {
-                let (infra, task) = get_future.await?;
-                (None, infra, task)
-            };
+            let (get_infra, get_watchdog_task) = construct_get().await?;
 
             let get_client = get_infra.get_client.clone();
 
-            let result = Self::new_or_restart(
-                get_infra, params, true, early_servicing_state, driver,
-            ).await;
+            let result = Self::new_or_restart(get_infra, params, true, None, driver).await;
 
             if let Err(err) = &result {
                 tracing::error!(
@@ -558,110 +512,70 @@ impl UnderhillVmWorker {
                 .context("failed to create thread pool")?
         };
 
-        // In a servicing scenario where the saved state is held on the VM host,
-        // we only know that saved state exists after we get the DPS information.
-        //
-        // For guest-side `kexec` experiments we won't get a host-driven "servicing
-        // scenario" indicator (there is no VTL2 reload). Allow a best-effort
-        // restore when the kexec script marks the boot with OPENHCL_KEXEC_SERVICING.
+        // In a host-driven servicing scenario, saved state comes from the host.
+        // After kexec, it comes from the persisted VTL2 memory region.
         let servicing_state_from_host = dps.general.is_servicing_scenario;
         let kexec_servicing = std::env::var_os("OPENHCL_KEXEC_SERVICING").is_some();
         let mut restored_state_from_host = false;
 
-        if (servicing_state_from_host || kexec_servicing) && servicing_state.is_none() {
-
+        if servicing_state_from_host || kexec_servicing {
             if let Some(TestScenarioConfig::RestoreStuck) = params.env_cfg.test_configuration {
                 tracing::info!(
                     "Test configuration SERVICING_RESTORE_STUCK is set. Waiting indefinitely in restore."
                 );
                 future::pending::<()>().await;
             }
+        }
 
-            // For kexec-based servicing, the persisted state may have already
-            // been read early (in Worker::new, before GET completed). Only
-            // attempt the read here if we don't already have state.
-            if kexec_servicing && servicing_state.is_none() {
-                tracing::debug!(
-                    CVM_ALLOWED,
-                    "kexec servicing: attempting to read persisted servicing state"
-                );
-
-                match bootloader_fdt_parser::ParsedBootDtInfo::new()
-                    .and_then(|parsed| {
-                        crate::loader::vtl2_config::read_servicing_state_from_persisted(&parsed)
-                    }) {
-                    Ok(Some(saved_state_buf)) => {
-                        servicing_state = Some(
-                            mesh::payload::decode(&saved_state_buf)
-                                .context("failed to decode persisted servicing state")?,
-                        );
-                        tracing::debug!(
-                            CVM_ALLOWED,
-                            saved_state_len = saved_state_buf.len(),
-                            "restored servicing state from persisted memory"
-                        );
-                    }
-                    Ok(None) => {
-                        tracing::info!(
-                            CVM_ALLOWED,
-                            "no persisted servicing state found; will try host"
-                        );
-                    }
-                    Err(err) => {
-                        tracing::warn!(
-                            CVM_ALLOWED,
-                            ?err,
-                            "failed to read persisted servicing state; will try host"
-                        );
-                    }
-                }
-            }
-
-            // If we still don't have state (either not kexec or persisted read
-            // failed/empty), fall back to getting it from the host.
-            if servicing_state.is_none() {
-                tracing::info!(
-                    CVM_ALLOWED,
-                    "VTL2 restart, getting servicing state from the host"
-                );
-
-                match get_client
-                    .get_saved_state_from_host()
-                    .instrument(tracing::info_span!("init/get_saved_state", CVM_ALLOWED))
-                    .await
-                {
-                    Ok(saved_state_buf) => {
-                        servicing_state = Some(
-                            mesh::payload::decode(&saved_state_buf)
-                                .context("failed to decode servicing state")?,
-                        );
-                        restored_state_from_host = true;
-                        tracing::info!(
-                            CVM_ALLOWED,
-                            saved_state_len = saved_state_buf.len(),
-                            "received servicing state from host"
-                        );
-                    }
-                    Err(err) if kexec_servicing && !servicing_state_from_host => {
-                        // For kexec experiments, tolerate missing state and continue
-                        // a normal boot; the host may not have been primed with a save.
-                        tracing::warn!(
-                            CVM_ALLOWED,
-                            ?err,
-                            "OPENHCL_KEXEC_SERVICING set but host returned no saved state; continuing without restore"
-                        );
-                    }
-                    Err(err) => {
-                        return Err(err).context("Failed to get saved state from host");
-                    }
-                }
-            }
+        if kexec_servicing {
+            let parsed = bootloader_fdt_parser::ParsedBootDtInfo::new()
+                .context("failed to parse device tree for persisted servicing state")?;
+            let saved_state_buf = crate::loader::vtl2_config::read_servicing_state_from_persisted(
+                &parsed,
+            )?
+            .context("OPENHCL_KEXEC_SERVICING set but no persisted servicing state found")?;
+            servicing_state = Some(
+                mesh::payload::decode(&saved_state_buf)
+                    .context("failed to decode persisted servicing state")?,
+            );
+            tracing::debug!(
+                CVM_ALLOWED,
+                saved_state_len = saved_state_buf.len(),
+                "restored servicing state from persisted memory"
+            );
+        } else if servicing_state_from_host {
+            tracing::info!(
+                CVM_ALLOWED,
+                "VTL2 restart, getting servicing state from the host"
+            );
+            let saved_state_buf = get_client
+                .get_saved_state_from_host()
+                .instrument(tracing::info_span!("init/get_saved_state", CVM_ALLOWED))
+                .await
+                .context("Failed to get saved state from host")?;
+            servicing_state = Some(
+                mesh::payload::decode(&saved_state_buf)
+                    .context("failed to decode servicing state")?,
+            );
+            restored_state_from_host = true;
+            tracing::info!(
+                CVM_ALLOWED,
+                saved_state_len = saved_state_buf.len(),
+                "received servicing state from host"
+            );
         }
 
         if let Some(state) = &mut servicing_state {
             state
                 .fix_post_restore()
                 .context("failed to fix up servicing state on restore")?;
+        }
+
+        if kexec_servicing {
+            let parsed = bootloader_fdt_parser::ParsedBootDtInfo::new()
+                .context("failed to parse device tree to clear persisted servicing state")?;
+            crate::loader::vtl2_config::clear_servicing_state_from_persisted(&parsed)
+                .context("failed to clear persisted servicing state")?;
         }
 
         let is_post_servicing = servicing_state.is_some();
@@ -2126,19 +2040,16 @@ async fn new_underhill_vm(
     let highest_vtl_gm = gm.vtl1().unwrap_or(gm.vtl0());
 
     // Perform a quick validation to make sure each range is appropriately
-    // accessible. Skip after kexec — the partition is never torn down so
-    // memory mappings are unchanged from the previous instance.
-    if std::env::var_os("OPENHCL_KEXEC_SERVICING").is_none() {
-        guest_memory_access_self_test(
-            &mem_layout,
-            is_restoring,
-            proto_partition.create_partition_available(),
-            highest_vtl_gm,
-            &shared_pool,
-            vtom,
-        )
-        .context("guest memory access self test failed")?;
-    }
+    // accessible.
+    guest_memory_access_self_test(
+        &mem_layout,
+        is_restoring,
+        proto_partition.create_partition_available(),
+        highest_vtl_gm,
+        &shared_pool,
+        vtom,
+    )
+    .context("guest memory access self test failed")?;
 
     // Set the gpa allocator to GET that is required by the attestation message.
     get_client.set_gpa_allocator(
