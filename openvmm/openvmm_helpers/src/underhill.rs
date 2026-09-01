@@ -68,7 +68,7 @@ pub async fn restore_underhill(
 /// Kexec-based servicing: trigger the guest to save state and kexec internally.
 ///
 /// Unlike normal servicing, no IGVM staging or host-driven reload is performed.
-/// The guest saves state to a persisted memory region, then does `kexec -e` to
+/// The guest saves state to a persisted memory region, then requests kexec to
 /// boot the new kernel. The new VTL2 instance reads the persisted state directly
 /// from memory — no state flows through the host.
 pub async fn kexec_service_underhill(

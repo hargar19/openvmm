@@ -232,11 +232,6 @@ impl LoadedVm {
             self.start(correlation_id).await;
         }
 
-        // Note: kexec pre-load (`kexec -l`) is deferred to servicing time
-        // rather than running at boot.  This avoids wasting CPU/IO when
-        // servicing may never be triggered, and allows loading the latest
-        // kernel at servicing time. See `try_kexec_after_servicing()`.
-
         // VTL2 settings services
         let (device_config_send, mut device_config_recv) = mesh::channel();
         let _vtl2_settings_service_handle = {
@@ -602,10 +597,8 @@ impl LoadedVm {
             std::future::pending::<()>().await;
         }
 
-        // Prepare kexec (build initramfs + kexec_file_load) before stopping the VM.
-        // This runs while the guest is still active, so the ~780ms of kexec
-        // preparation does not contribute to blackout time.  After VM stop,
-        // only `kexec -e` (instant) is needed.
+        // Build the initramfs and stage the kernel before stopping the VM so
+        // preparation does not contribute to blackout time.
         let kexec_prepared =
             self.prepare_kexec_if_enabled(correlation_id, capabilities_flags.enable_kexec());
 
@@ -631,10 +624,6 @@ impl LoadedVm {
                     "servicing save completed; preparing to send state to host"
                 );
 
-                // Experimental: if enabled, restart VTL2 from inside the guest
-                // using Linux kexec rather than waiting for the host-driven
-                // VTL2 reload boundary.
-                //
                 // This hook runs BEFORE sending state to the host.  The state
                 // is persisted into a reserved memory region so the kexec'd
                 // VTL2 can read it back.  If kexec succeeds (exec never
@@ -684,6 +673,15 @@ impl LoadedVm {
     /// time. Returns `true` if the kernel is staged and ready for kexec.
     fn prepare_kexec_if_enabled(&self, correlation_id: Guid, enabled: bool) -> bool {
         if !enabled {
+            return false;
+        }
+
+        if cfg!(not(guest_arch = "x86_64")) {
+            tracing::error!(
+                CVM_ALLOWED,
+                %correlation_id,
+                "kexec servicing is only supported for x86_64 guests"
+            );
             return false;
         }
 
