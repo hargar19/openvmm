@@ -101,7 +101,7 @@ fn prepare_kexec_vmlinux(initrd_path: &str, cmdline: &str) -> anyhow::Result<()>
         kernel_file.as_raw_fd(),
         initrd_file.as_raw_fd(),
         &cmdline_cstr,
-        0,
+        kexec_sys::KEXEC_FILE_FORCE_DTB,
     )
     .context("kexec_file_load syscall failed for vmlinux")?;
 
