@@ -11,9 +11,8 @@
 //! syscall directly via the `kexec_sys` crate, bypassing userspace
 //! kexec-tools entirely.
 //!
-//! Using `kexec_file_load` (rather than `kexec_load` via the userspace
-//! `kexec -l` binary) is required for the future KHO (Kexec Handover)
-//! support, which hooks into the `kexec_file_load` kernel path.
+//! Using `kexec_file_load` is required for KHO (Kexec Handover) support,
+//! which hooks into the file-based kernel loading path.
 //!
 //! The cpio format implementation follows the "newc" (SVR4 with no CRC)
 //! specification as documented in the Linux kernel source:
@@ -51,9 +50,7 @@ const KERNEL_MODULES: &[(&str, &str)] = &[
 
 /// Build the initramfs and stage the kernel for kexec, entirely in Rust.
 ///
-/// This is functionally equivalent to `kexec_prepare.sh` but eliminates
-/// the staging directory and most process spawning. The cpio archive is
-/// built in memory and streamed through `gzip -1` to a temp file, then
+/// The cpio archive is built in memory and compressed into a temp file, then
 /// the `kexec_file_load` syscall stages the kernel for a future
 /// `reboot(LINUX_REBOOT_CMD_KEXEC)`.
 pub fn prepare_kexec() -> anyhow::Result<()> {
