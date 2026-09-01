@@ -546,6 +546,7 @@ impl VmController {
                 GuestServicingFlags {
                     nvme_keepalive: params.nvme_keepalive,
                     mana_keepalive: params.mana_keepalive,
+                    kexec: true,
                 },
             )
             .await?;
@@ -571,6 +572,7 @@ impl VmController {
                 GuestServicingFlags {
                     nvme_keepalive: params.nvme_keepalive,
                     mana_keepalive: params.mana_keepalive,
+                    kexec: false,
                 },
                 file.into(),
             )

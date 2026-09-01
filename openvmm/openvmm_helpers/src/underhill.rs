@@ -75,6 +75,8 @@ pub async fn kexec_service_underhill(
     send: &mesh::Sender<GuestEmulationRequest>,
     flags: GuestServicingFlags,
 ) -> anyhow::Result<()> {
+    send.call(GuestEmulationRequest::ClearVtl0Start, ()).await?;
+
     // Fire-and-forget: send a save notification to trigger the guest-side
     // servicing + kexec flow. The guest will serialize state, persist it to
     // the reserved memory region, and exec into the new kernel. It will never

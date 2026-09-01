@@ -546,6 +546,10 @@ impl<T: RingMem + Unpin> GedChannel<T> {
                     state.waiting_for_vtl0_start.push(rpc);
                 }
             }
+            GuestEmulationRequest::ClearVtl0Start(rpc) => {
+                self.vtl0_start_report = None;
+                rpc.handle_sync(|()| ());
+            }
             GuestEmulationRequest::ModifyVtl2Settings(rpc) => {
                 let (data, response) = rpc.split();
                 if self.modify.is_some() {
@@ -589,7 +593,8 @@ impl<T: RingMem + Unpin> GedChannel<T> {
                         correlation_id: Guid::ZERO,
                         capabilities_flags: SaveGuestVtl2StateFlags::new()
                             .with_enable_nvme_keepalive(rpc.input().nvme_keepalive)
-                            .with_enable_mana_keepalive(rpc.input().mana_keepalive),
+                            .with_enable_mana_keepalive(rpc.input().mana_keepalive)
+                            .with_enable_kexec(rpc.input().kexec),
                         timeout_hint_secs: 60,
                     };
 

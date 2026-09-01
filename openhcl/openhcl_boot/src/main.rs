@@ -181,8 +181,6 @@ fn build_kernel_command_line(
         "rdinit=/underhill-init",
         // Default to user-mode NVMe driver.
         "OPENHCL_NVME_VFIO=1",
-        // Enable guest-side kexec restart boundary after servicing save.
-        "OPENHCL_SERVICING_RESTART_VIA_KEXEC=1",
         // The next three items reduce the memory overhead of the storvsc driver.
         // Since it is only used for DVD, performance is not critical.
         "hv_storvsc.storvsc_vcpus_per_sub_channel=2048",
@@ -1376,7 +1374,10 @@ mod test {
             &ext,
             &[
                 (ONE_MB..(persisted_header_end), E820_RESERVED),
-                (persisted_header_end..(ONE_MB + 2 * PAGE_SIZE), E820_RESERVED),
+                (
+                    persisted_header_end..(ONE_MB + 2 * PAGE_SIZE),
+                    E820_RESERVED,
+                ),
                 ((ONE_MB + 2 * PAGE_SIZE)..persisted_end, E820_RESERVED),
                 (persisted_end..2 * ONE_MB, E820_RAM),
                 (2 * ONE_MB..3 * ONE_MB, E820_RESERVED),

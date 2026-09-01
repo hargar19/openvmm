@@ -606,7 +606,8 @@ impl LoadedVm {
         // This runs while the guest is still active, so the ~780ms of kexec
         // preparation does not contribute to blackout time.  After VM stop,
         // only `kexec -e` (instant) is needed.
-        let kexec_prepared = self.prepare_kexec_if_enabled(correlation_id);
+        let kexec_prepared =
+            self.prepare_kexec_if_enabled(correlation_id, capabilities_flags.enable_kexec());
 
         let running = self.state_units.is_running();
         let success = match self
@@ -681,8 +682,7 @@ impl LoadedVm {
     /// Prepare kexec if the feature is enabled.  Runs BEFORE VM stop so that
     /// the initramfs build and `kexec_file_load` do not contribute to blackout
     /// time. Returns `true` if the kernel is staged and ready for kexec.
-    fn prepare_kexec_if_enabled(&self, correlation_id: Guid) -> bool {
-        let enabled = std::env::var_os("OPENHCL_SERVICING_RESTART_VIA_KEXEC").is_some();
+    fn prepare_kexec_if_enabled(&self, correlation_id: Guid, enabled: bool) -> bool {
         if !enabled {
             return false;
         }

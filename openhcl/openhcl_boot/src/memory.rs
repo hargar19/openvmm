@@ -242,8 +242,7 @@ impl<'a, I: Iterator<Item = MemoryRange>> AddressSpaceManagerBuilder<'a, I> {
         // Split the persisted state region into three: the header which is the
         // first 4K page, the topology protobuf payload, and the servicing
         // state region for kexec. All are reserved ranges.
-        let (persisted_header, remainder) =
-            persisted_state_region.split_at_offset(PAGE_SIZE_4K);
+        let (persisted_header, remainder) = persisted_state_region.split_at_offset(PAGE_SIZE_4K);
         let half = (remainder.len() / 2) & !(PAGE_SIZE_4K - 1);
         let (persisted_payload, persisted_servicing) = remainder.split_at_offset(half);
 
@@ -253,7 +252,10 @@ impl<'a, I: Iterator<Item = MemoryRange>> AddressSpaceManagerBuilder<'a, I> {
         reserved.clear();
         reserved.push((persisted_header, ReservedMemoryType::PersistedStateHeader));
         reserved.push((persisted_payload, ReservedMemoryType::PersistedStatePayload));
-        reserved.push((persisted_servicing, ReservedMemoryType::PersistedServicingState));
+        reserved.push((
+            persisted_servicing,
+            ReservedMemoryType::PersistedServicingState,
+        ));
         reserved.extend(vtl2_config.map(|r| (r, ReservedMemoryType::Vtl2Config)));
         reserved.extend(
             reserved_range
