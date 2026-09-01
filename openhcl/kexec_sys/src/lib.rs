@@ -16,6 +16,9 @@ use std::os::unix::io::RawFd;
 /// `kexec_file_load` syscall number on x86_64.
 const SYS_KEXEC_FILE_LOAD: libc::c_long = 320;
 
+/// Carry the current x86 device tree into the next kernel.
+pub const KEXEC_FILE_FORCE_DTB: u64 = 0x20;
+
 /// Call the `kexec_file_load(2)` syscall to stage a kernel for kexec.
 ///
 /// This bypasses userspace kexec-tools entirely. The kernel handles ELF
