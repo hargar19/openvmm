@@ -601,7 +601,7 @@ impl LoadedVm {
         // preparation does not contribute to blackout time.
         let kexec_enabled = capabilities_flags.enable_kexec()
             || std::env::var_os("OPENHCL_SERVICING_RESTART_VIA_KEXEC").is_some();
-        let kexec_prepared = self.prepare_kexec_if_enabled(correlation_id, kexec_enabled);
+        let staged_online_cpus = self.prepare_kexec_if_enabled(correlation_id, kexec_enabled);
 
         let running = self.state_units.is_running();
         let success = match self
@@ -632,7 +632,7 @@ impl LoadedVm {
                 // host to complete the save protocol.  If kexec fails (script
                 // missing, exec error, etc.), we fall through and send state
                 // normally for the host-driven reload path.
-                self.try_kexec_after_servicing(correlation_id, &state_buf, kexec_prepared);
+                self.try_kexec_after_servicing(correlation_id, &state_buf, staged_online_cpus);
 
                 tracing::info!(
                     CVM_ALLOWED,
@@ -672,9 +672,9 @@ impl LoadedVm {
     /// Prepare kexec if the feature is enabled.  Runs BEFORE VM stop so that
     /// the initramfs build and `kexec_file_load` do not contribute to blackout
     /// time. Returns `true` if the kernel is staged and ready for kexec.
-    fn prepare_kexec_if_enabled(&self, correlation_id: Guid, enabled: bool) -> bool {
+    fn prepare_kexec_if_enabled(&self, correlation_id: Guid, enabled: bool) -> Option<String> {
         if !enabled {
-            return false;
+            return None;
         }
 
         if cfg!(not(guest_arch = "x86_64")) {
@@ -683,7 +683,7 @@ impl LoadedVm {
                 %correlation_id,
                 "kexec servicing is only supported for x86_64 guests"
             );
-            return false;
+            return None;
         }
 
         tracing::info!(
@@ -695,9 +695,9 @@ impl LoadedVm {
         let prepare_result = kexec_prepare::prepare_kexec();
 
         match prepare_result {
-            Ok(()) => {
+            Ok(online_cpus) => {
                 tracing::info!(CVM_ALLOWED, %correlation_id, "kexec prepare completed");
-                true
+                Some(online_cpus)
             }
             Err(err) => {
                 tracing::error!(
@@ -706,7 +706,7 @@ impl LoadedVm {
                     error = format!("{err:#}").as_str(),
                     "kexec prepare failed; will fall back to host restart after save"
                 );
-                false
+                None
             }
         }
     }
@@ -715,11 +715,11 @@ impl LoadedVm {
         &self,
         correlation_id: Guid,
         state_buf: &[u8],
-        kexec_prepared: bool,
+        staged_online_cpus: Option<String>,
     ) {
-        if !kexec_prepared {
+        let Some(staged_online_cpus) = staged_online_cpus else {
             return;
-        }
+        };
 
         // Persist the servicing state into the reserved memory region so the
         // next instance can read it back without involving the host.
@@ -736,6 +736,41 @@ impl LoadedVm {
             return;
         }
 
+        if let Err(err) = self.partition.prepare_sidecar_for_kexec() {
+            tracing::error!(
+                CVM_ALLOWED,
+                %correlation_id,
+                error = &err as &dyn std::error::Error,
+                "sidecar is not ready for kexec; falling back to host restart"
+            );
+            return;
+        }
+
+        let current_online_cpus = match kexec_prepare::online_cpu_mask() {
+            Ok(mask) => mask,
+            Err(err) => {
+                let _ = self.partition.cancel_sidecar_kexec();
+                tracing::error!(
+                    CVM_ALLOWED,
+                    %correlation_id,
+                    error = err.as_ref() as &dyn std::error::Error,
+                    "failed to verify CPU ownership for kexec; falling back to host restart"
+                );
+                return;
+            }
+        };
+        if current_online_cpus != staged_online_cpus {
+            let _ = self.partition.cancel_sidecar_kexec();
+            tracing::error!(
+                CVM_ALLOWED,
+                %correlation_id,
+                %staged_online_cpus,
+                %current_online_cpus,
+                "CPU ownership changed after kexec staging; falling back to host restart"
+            );
+            return;
+        }
+
         tracing::info!(
             CVM_ALLOWED,
             %correlation_id,
@@ -745,6 +780,14 @@ impl LoadedVm {
         // kexec_reboot() calls reboot(LINUX_REBOOT_CMD_KEXEC).
         // If successful, this never returns.
         let err = kexec_sys::kexec_reboot();
+        if let Err(cancel_err) = self.partition.cancel_sidecar_kexec() {
+            tracing::error!(
+                CVM_ALLOWED,
+                %correlation_id,
+                error = &cancel_err as &dyn std::error::Error,
+                "failed to cancel sidecar kexec preparation"
+            );
+        }
         tracing::error!(
             CVM_ALLOWED,
             %correlation_id,

@@ -60,6 +60,8 @@ mod ioctl {
     nix::ioctl_write_int_bad!(mshv_vtl_sidecar_stop, nix::request_code_none!(BASE, 0xf1));
     nix::ioctl_write_int_bad!(mshv_vtl_sidecar_run, nix::request_code_none!(BASE, 0xf2));
     nix::ioctl_read!(mshv_vtl_sidecar_info, BASE, 0xf3, SidecarInfo);
+    nix::ioctl_none!(mshv_vtl_sidecar_prepare_kexec, BASE, 0xf4);
+    nix::ioctl_none!(mshv_vtl_sidecar_cancel_kexec, BASE, 0xf5);
 
     #[repr(C)]
     pub(crate) struct SidecarInfo {
@@ -183,6 +185,26 @@ impl SidecarClient {
             .iter()
             .find_map(|node| node.cpus.contains(&cpu).then_some(node.cpus.start))
             .expect("invalid cpu")
+    }
+
+    /// Verify that all sidecar VPs are idle and block new sidecar operations.
+    pub fn prepare_for_kexec(&self) -> Result<(), SidecarError> {
+        let node = self.nodes.first().expect("sidecar client has no nodes");
+        // SAFETY: this ioctl has no pointer arguments and operates on the
+        // sidecar instance associated with this valid file descriptor.
+        unsafe { ioctl::mshv_vtl_sidecar_prepare_kexec(node.state.file.as_raw_fd()) }
+            .map_err(|err| SidecarError::Io(err.into()))?;
+        Ok(())
+    }
+
+    /// Allow sidecar operations again after a failed kexec attempt.
+    pub fn cancel_kexec(&self) -> Result<(), SidecarError> {
+        let node = self.nodes.first().expect("sidecar client has no nodes");
+        // SAFETY: this ioctl has no pointer arguments and operates on the
+        // sidecar instance associated with this valid file descriptor.
+        unsafe { ioctl::mshv_vtl_sidecar_cancel_kexec(node.state.file.as_raw_fd()) }
+            .map_err(|err| SidecarError::Io(err.into()))?;
+        Ok(())
     }
 }
 

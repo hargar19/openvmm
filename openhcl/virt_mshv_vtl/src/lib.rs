@@ -873,6 +873,16 @@ struct ExitActivity {
 
 /// Immutable access to useful bits of Partition state.
 impl UhPartition {
+    /// Verify that sidecar VPs are idle and block new sidecar operations.
+    pub fn prepare_sidecar_for_kexec(&self) -> Result<(), sidecar_client::SidecarError> {
+        self.inner.hcl.prepare_sidecar_for_kexec()
+    }
+
+    /// Cancel sidecar kexec preparation after a failed reboot attempt.
+    pub fn cancel_sidecar_kexec(&self) -> Result<(), sidecar_client::SidecarError> {
+        self.inner.hcl.cancel_sidecar_kexec()
+    }
+
     /// Revokes guest VSM.
     pub fn revoke_guest_vsm(&self) -> Result<(), RevokeGuestVsmError> {
         fn revoke<T: Inspect>(vsm_state: &mut GuestVsmState<T>) -> Result<(), RevokeGuestVsmError> {
@@ -1524,9 +1534,6 @@ pub struct UhPartitionNewParams<'a> {
     /// Do not hotplug sidecar VPs on their first exit. Just continue running
     /// the VP remotely.
     pub no_sidecar_hotplug: bool,
-    /// Skip sidecar initialization entirely. Used during kexec-based servicing
-    /// to match the original servicing behavior where sidecar is disabled.
-    pub skip_sidecar: bool,
     /// Use MMIO access hypercalls.
     pub use_mmio_hypercalls: bool,
     /// Intercept guest debug exceptions to support gdbstub.
@@ -1705,14 +1712,7 @@ impl<'a> UhProtoPartition<'a> {
         };
 
         // Try to open the sidecar device, if it is present.
-        // During kexec-based servicing, skip sidecar to match the original
-        // servicing behavior where openhcl_boot disables sidecar on reload.
-        let sidecar = if params.skip_sidecar {
-            tracing::debug!("skipping sidecar initialization (kexec servicing)");
-            None
-        } else {
-            sidecar_client::SidecarClient::new(driver).map_err(Error::Sidecar)?
-        };
+        let sidecar = sidecar_client::SidecarClient::new(driver).map_err(Error::Sidecar)?;
 
         let hcl = Hcl::new(hcl_isolation, sidecar).map_err(Error::Hcl)?;
 

@@ -53,9 +53,9 @@ const KERNEL_MODULES: &[(&str, &str)] = &[
 /// The cpio archive is built in memory and compressed into a temp file, then
 /// the `kexec_file_load` syscall stages the kernel for a future
 /// `reboot(LINUX_REBOOT_CMD_KEXEC)`.
-pub fn prepare_kexec() -> anyhow::Result<()> {
+pub fn prepare_kexec() -> anyhow::Result<String> {
     let binary_path = resolve_binary_path();
-    let cmdline = build_cmdline().context("failed to build kernel command line")?;
+    let (cmdline, online_cpus) = build_cmdline().context("failed to build kernel command line")?;
 
     // Build cpio archive, compress via gzip, write to temp file.
     let img_path = "/tmp/initramfs.gz";
@@ -74,7 +74,7 @@ pub fn prepare_kexec() -> anyhow::Result<()> {
     // subsystem, so the temp file is no longer needed.
     let _ = std::fs::remove_file(img_path);
 
-    Ok(())
+    Ok(online_cpus)
 }
 
 /// Stage an uncompressed vmlinux through the kernel's x86 ELF loader.
@@ -116,24 +116,37 @@ fn resolve_binary_path() -> PathBuf {
 
 /// Build the kernel command line for the kexec'd kernel.
 ///
-/// Reads `/proc/cmdline`, strips `boot_cpus=` (so all CPUs SMP-boot after
-/// kexec when sidecar is no longer active), and adds `OPENHCL_KEXEC_SERVICING=1`
-/// to tell the new `underhill_core` instance to read persisted state instead
-/// of fetching it from the host.
-fn build_cmdline() -> anyhow::Result<String> {
+/// Reads `/proc/cmdline`, preserves the existing `boot_cpus=` ownership, and
+/// adds `OPENHCL_KEXEC_SERVICING=1` to tell the new `underhill_core` instance
+/// to read persisted state instead of fetching it from the host.
+fn build_cmdline() -> anyhow::Result<(String, String)> {
     let raw = std::fs::read_to_string("/proc/cmdline").context("failed to read /proc/cmdline")?;
+    let online_cpus = online_cpu_mask()?;
 
-    let mut cmdline: String = raw
+    Ok((build_kexec_cmdline(&raw, &online_cpus), online_cpus))
+}
+
+pub(super) fn online_cpu_mask() -> anyhow::Result<String> {
+    Ok(std::fs::read_to_string("/sys/devices/system/cpu/online")
+        .context("failed to read online CPU mask")?
+        .trim()
+        .to_owned())
+}
+
+fn build_kexec_cmdline(raw: &str, online_cpus: &str) -> String {
+    let mut words: Vec<_> = raw
         .split_whitespace()
-        .filter(|w| !w.starts_with("boot_cpus="))
-        .collect::<Vec<_>>()
-        .join(" ");
+        .filter(|word| !word.starts_with("boot_cpus="))
+        .collect();
+    let boot_cpus = format!("boot_cpus={online_cpus}");
+    words.push(&boot_cpus);
+    let mut cmdline = words.join(" ");
 
     if !cmdline.contains("OPENHCL_KEXEC_SERVICING=") {
         cmdline.push_str(" OPENHCL_KEXEC_SERVICING=1");
     }
 
-    Ok(cmdline)
+    cmdline
 }
 
 /// Build a gzip-compressed cpio newc archive and write it to `output_path`.
@@ -392,4 +405,20 @@ fn write_cpio_trailer(out: &mut impl Write) -> io::Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::build_kexec_cmdline;
+    use test_with_tracing::test;
+
+    #[test]
+    fn kexec_cmdline_uses_current_online_cpus() {
+        let cmdline = build_kexec_cmdline("console=ttyS2 boot_cpus=0\n", "0,3-4");
+
+        assert_eq!(
+            cmdline,
+            "console=ttyS2 boot_cpus=0,3-4 OPENHCL_KEXEC_SERVICING=1"
+        );
+    }
 }
