@@ -2652,8 +2652,8 @@ impl Hcl {
         }
 
         let data = protocol::hcl_kick_cpus {
-            len: cpu_bitmap.len() as u64,
-            cpu_mask: cpu_bitmap.as_bitptr().pointer(),
+            len: cpu_bitmap.as_raw_slice().len() as u64,
+            cpu_mask: cpu_bitmap.as_raw_slice().as_ptr(),
             flags: protocol::hcl_kick_cpus_flags::new()
                 .with_cancel_run(cancel_run)
                 .with_wait_for_other_cpus(wait_for_other_cpus),
