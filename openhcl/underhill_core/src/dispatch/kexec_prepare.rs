@@ -116,9 +116,10 @@ fn resolve_binary_path() -> PathBuf {
 
 /// Build the kernel command line for the kexec'd kernel.
 ///
-/// Reads `/proc/cmdline`, preserves the existing `boot_cpus=` ownership, and
-/// adds `OPENHCL_KEXEC_SERVICING=1` to tell the new `underhill_core` instance
-/// to read persisted state instead of fetching it from the host.
+/// Reads `/proc/cmdline`, removes `boot_cpus=` so the successor kernel brings
+/// up all CPUs, and adds `OPENHCL_KEXEC_SERVICING=1` to tell the new
+/// `underhill_core` instance to read persisted state instead of fetching it
+/// from the host.
 fn build_cmdline() -> anyhow::Result<(String, String)> {
     let raw = std::fs::read_to_string("/proc/cmdline").context("failed to read /proc/cmdline")?;
     let online_cpus = online_cpu_mask()?;
@@ -133,13 +134,11 @@ pub(super) fn online_cpu_mask() -> anyhow::Result<String> {
         .to_owned())
 }
 
-fn build_kexec_cmdline(raw: &str, online_cpus: &str) -> String {
-    let mut words: Vec<_> = raw
+fn build_kexec_cmdline(raw: &str, _online_cpus: &str) -> String {
+    let words: Vec<_> = raw
         .split_whitespace()
         .filter(|word| !word.starts_with("boot_cpus="))
         .collect();
-    let boot_cpus = format!("boot_cpus={online_cpus}");
-    words.push(&boot_cpus);
     let mut cmdline = words.join(" ");
 
     if !cmdline.contains("OPENHCL_KEXEC_SERVICING=") {
@@ -413,12 +412,9 @@ mod tests {
     use test_with_tracing::test;
 
     #[test]
-    fn kexec_cmdline_uses_current_online_cpus() {
+    fn kexec_cmdline_removes_boot_cpus() {
         let cmdline = build_kexec_cmdline("console=ttyS2 boot_cpus=0\n", "0,3-4");
 
-        assert_eq!(
-            cmdline,
-            "console=ttyS2 boot_cpus=0,3-4 OPENHCL_KEXEC_SERVICING=1"
-        );
+        assert_eq!(cmdline, "console=ttyS2 OPENHCL_KEXEC_SERVICING=1");
     }
 }
