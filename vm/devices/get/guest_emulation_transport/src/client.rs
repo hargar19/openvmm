@@ -3,6 +3,7 @@
 
 use super::process_loop::msg;
 use super::process_loop::msg::IgvmAttestRequestData;
+use crate::api::GuestDrivenServicingRequest;
 use crate::api::GuestSaveRequest;
 use crate::api::platform_settings;
 use chipset_resources::battery::HostBatteryUpdate;
@@ -805,6 +806,25 @@ impl GuestEmulationTransportClient {
     pub async fn take_save_request_recv(&self) -> Option<mesh::Receiver<GuestSaveRequest>> {
         self.control
             .call(msg::Msg::TakeSaveRequestReceiver, ())
+            .await
+    }
+
+    /// Take the guest-driven servicing receiver. Returns `None` if already taken.
+    /// Only one image may be pending or being processed at a time.
+    pub async fn take_guest_driven_servicing_recv(
+        &self,
+    ) -> Option<mesh::Receiver<GuestDrivenServicingRequest>> {
+        self.control
+            .call(msg::Msg::TakeGuestDrivenServicingReceiver, ())
+            .await
+    }
+
+    /// Release a completed transfer after its image has been disposed of.
+    /// Returns `true` only if the GUID matches the completed, busy transfer.
+    /// This is local bookkeeping; no response is sent to the host.
+    pub async fn finish_guest_driven_servicing(&self, correlation_id: Guid) -> bool {
+        self.control
+            .call(msg::Msg::FinishGuestDrivenServicing, correlation_id)
             .await
     }
 
