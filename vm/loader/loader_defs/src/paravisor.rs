@@ -466,9 +466,53 @@ pub const PRODUCT_POLICY_MAX_SIZE_BYTES: usize =
     (PARAVISOR_MEASURED_VTL2_CONFIG_SIZE_PAGES as usize) * (HV_PAGE_SIZE as usize)
         - PRODUCT_POLICY_INLINE_OFFSET;
 
+/// Measured byte ranges for a matching initrd and raw custom kexec binary.
+///
+/// Optionally stored after the inline product policy at the offset returned by
+/// [`kexec_payload_descriptor_offset`]. Sizes exclude page padding. Bases are
+/// guest physical addresses in the IGVM image, before relocation.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct KexecPayloadDescriptor {
+    /// Magic value. Must be [`Self::MAGIC`].
+    pub magic: u64,
+    /// Layout version. Must be [`Self::VERSION`].
+    pub version: u32,
+    /// Reserved; must be zero.
+    pub reserved: u32,
+    /// Guest physical base address of the matching initrd.
+    pub initrd_base: u64,
+    /// Exact initrd size in bytes.
+    pub initrd_size: u64,
+    /// Guest physical base address of the raw custom binary.
+    pub custom_binary_base: u64,
+    /// Exact custom binary size in bytes.
+    pub custom_binary_size: u64,
+}
+
+impl KexecPayloadDescriptor {
+    /// Magic value with little-endian bytes `OHCLKEX1`.
+    pub const MAGIC: u64 = u64::from_le_bytes(*b"OHCLKEX1");
+    /// Current descriptor layout version.
+    pub const VERSION: u32 = 1;
+}
+
+/// Returns the eight-byte-aligned offset after the product policy, provided the
+/// entire descriptor fits in the measured VTL2 config region.
+pub fn kexec_payload_descriptor_offset(product_policy_size: u32) -> Option<usize> {
+    let policy_end =
+        PRODUCT_POLICY_INLINE_OFFSET.checked_add(usize::try_from(product_policy_size).ok()?)?;
+    let offset = policy_end.checked_add(7)? & !7;
+    let end = offset.checked_add(size_of::<KexecPayloadDescriptor>())?;
+    let region_size =
+        (PARAVISOR_MEASURED_VTL2_CONFIG_SIZE_PAGES as usize).checked_mul(HV_PAGE_SIZE as usize)?;
+    (end <= region_size).then_some(offset)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use test_with_tracing::test;
     // ---------------------------------------------------------------
     // ParavisorMeasuredVtl2Config: struct layout
     // ---------------------------------------------------------------
@@ -519,5 +563,51 @@ mod tests {
         assert_eq!(decoded.magic, ParavisorMeasuredVtl2Config::MAGIC);
         assert_eq!(decoded.vtom_offset_bit, 17);
         assert_eq!(decoded.product_policy_size, 0);
+    }
+
+    #[test]
+    fn kexec_payload_descriptor_layout() {
+        assert_eq!(PRODUCT_POLICY_INLINE_OFFSET, 24);
+        assert_eq!(PRODUCT_POLICY_MAX_SIZE_BYTES, 4072);
+        assert_eq!(size_of::<KexecPayloadDescriptor>(), 48);
+        assert_eq!(align_of::<KexecPayloadDescriptor>(), 8);
+        assert_eq!(core::mem::offset_of!(KexecPayloadDescriptor, magic), 0);
+        assert_eq!(core::mem::offset_of!(KexecPayloadDescriptor, version), 8);
+        assert_eq!(core::mem::offset_of!(KexecPayloadDescriptor, reserved), 12);
+        assert_eq!(
+            core::mem::offset_of!(KexecPayloadDescriptor, initrd_base),
+            16
+        );
+        assert_eq!(
+            core::mem::offset_of!(KexecPayloadDescriptor, initrd_size),
+            24
+        );
+        assert_eq!(
+            core::mem::offset_of!(KexecPayloadDescriptor, custom_binary_base),
+            32
+        );
+        assert_eq!(
+            core::mem::offset_of!(KexecPayloadDescriptor, custom_binary_size),
+            40
+        );
+        assert_ne!(
+            KexecPayloadDescriptor::MAGIC,
+            ParavisorMeasuredVtl2Config::MAGIC
+        );
+        assert_eq!(KexecPayloadDescriptor::MAGIC.to_le_bytes(), *b"OHCLKEX1");
+        assert_eq!(KexecPayloadDescriptor::VERSION, 1);
+    }
+
+    #[test]
+    fn kexec_payload_descriptor_offset_bounds() {
+        assert_eq!(kexec_payload_descriptor_offset(0), Some(24));
+        for policy_size in 1..=8 {
+            assert_eq!(kexec_payload_descriptor_offset(policy_size), Some(32));
+        }
+        assert_eq!(kexec_payload_descriptor_offset(9), Some(40));
+        assert_eq!(kexec_payload_descriptor_offset(4024), Some(4048));
+        assert_eq!(kexec_payload_descriptor_offset(4025), None);
+        assert_eq!(kexec_payload_descriptor_offset(4072), None);
+        assert_eq!(kexec_payload_descriptor_offset(u32::MAX), None);
     }
 }

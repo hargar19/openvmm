@@ -9,6 +9,7 @@ use crate::common::ReadSeek;
 use crate::cpuid::HV_PSP_CPUID_PAGE;
 use crate::importer::Aarch64Register;
 use crate::importer::BootPageAcceptance;
+use crate::importer::GuestArch;
 use crate::importer::IgvmParameterType;
 use crate::importer::ImageLoad;
 use crate::importer::IsolationConfig;
@@ -101,6 +102,18 @@ pub enum Error {
     ImportInitrd(#[source] crate::common::ImportFileRegionError),
     #[error("failed to read initrd for CRC")]
     InitrdRead(#[source] std::io::Error),
+    #[error("custom binary requires a nonempty matching initrd")]
+    CustomBinaryRequiresInitrd,
+    #[error("invalid custom binary size: {0}")]
+    InvalidCustomBinarySize(u64),
+    #[error("custom binary address computation overflowed")]
+    CustomBinaryAddressOverflow,
+    #[error("failed to import custom binary")]
+    ImportCustomBinary(#[source] crate::common::ImportFileRegionError),
+    #[error(
+        "product policy of {0} bytes leaves insufficient room for the kexec payload descriptor in the measured VTL2 config region"
+    )]
+    KexecPayloadDescriptorSpace(u32),
     #[error("PageTableBuilder: {0}")]
     PageTableBuilder(#[from] page_table::Error),
 }
@@ -159,11 +172,19 @@ fn validate_product_policy_for_build(policy: &ProductPolicy) {
 fn build_measured_vtl2_config_region(
     mut config: ParavisorMeasuredVtl2Config,
     product_policy: Option<&ProductPolicy>,
-) -> Vec<u8> {
+    kexec_payload: Option<KexecPayloadDescriptor>,
+) -> Result<Vec<u8>, Error> {
     let policy_bytes = product_policy.map(encode_product_policy_bytes);
     let policy_bytes = policy_bytes.as_deref().unwrap_or(&[]);
     config.product_policy_size = policy_bytes.len() as u32;
 
+    let descriptor_offset = kexec_payload
+        .map(|_| {
+            kexec_payload_descriptor_offset(config.product_policy_size).ok_or(
+                Error::KexecPayloadDescriptorSpace(config.product_policy_size),
+            )
+        })
+        .transpose()?;
     let buf_bytes = (PARAVISOR_MEASURED_VTL2_CONFIG_SIZE_PAGES as usize) * (HV_PAGE_SIZE as usize);
     let mut buf = vec![0u8; buf_bytes];
 
@@ -173,7 +194,75 @@ fn build_measured_vtl2_config_region(
         let off = PRODUCT_POLICY_INLINE_OFFSET;
         buf[off..off + policy_bytes.len()].copy_from_slice(policy_bytes);
     }
-    buf
+    if let Some((descriptor, offset)) = kexec_payload.zip(descriptor_offset) {
+        buf[offset..offset + size_of::<KexecPayloadDescriptor>()]
+            .copy_from_slice(descriptor.as_bytes());
+    }
+    Ok(buf)
+}
+
+fn custom_binary_end(base: u64, size: u64) -> Result<u64, Error> {
+    if !base.is_multiple_of(HV_PAGE_SIZE) {
+        return Err(Error::MemoryUnaligned(base));
+    }
+    if size == 0 {
+        return Err(Error::InvalidCustomBinarySize(size));
+    }
+    let padded_size = size
+        .checked_add(HV_PAGE_SIZE - 1)
+        .ok_or(Error::InvalidCustomBinarySize(size))?
+        & !(HV_PAGE_SIZE - 1);
+    base.checked_add(padded_size)
+        .ok_or(Error::CustomBinaryAddressOverflow)
+}
+
+fn import_custom_binary<R: GuestArch>(
+    importer: &mut dyn ImageLoad<R>,
+    custom_binary: Option<(&mut dyn ReadSeek, u64)>,
+    next_address: &mut u64,
+    initrd: (u64, u64),
+    memory_start: u64,
+    memory_size: u64,
+) -> Result<Option<KexecPayloadDescriptor>, Error> {
+    let Some((file, size)) = custom_binary else {
+        return Ok(None);
+    };
+    let (initrd_base, initrd_size) = initrd;
+    if initrd_size == 0 {
+        return Err(Error::CustomBinaryRequiresInitrd);
+    }
+    let base = *next_address;
+    let end = custom_binary_end(base, size)?;
+    let memory_end = memory_start
+        .checked_add(memory_size)
+        .ok_or(Error::CustomBinaryAddressOverflow)?;
+    if end > memory_end {
+        return Err(Error::NotEnoughMemory(end.saturating_sub(memory_start)));
+    }
+    ChunkBuf::new()
+        .import_file_region(
+            importer,
+            ImportFileRegion {
+                file,
+                file_offset: 0,
+                file_length: size,
+                gpa: base,
+                memory_length: size,
+                acceptance: BootPageAcceptance::Exclusive,
+                tag: "underhill-custom-binary",
+            },
+        )
+        .map_err(Error::ImportCustomBinary)?;
+    *next_address = end;
+    Ok(Some(KexecPayloadDescriptor {
+        magic: KexecPayloadDescriptor::MAGIC,
+        version: KexecPayloadDescriptor::VERSION,
+        reserved: 0,
+        initrd_base,
+        initrd_size,
+        custom_binary_base: base,
+        custom_binary_size: size,
+    }))
 }
 
 /// Kernel Command line type.
@@ -200,6 +289,7 @@ pub fn load_openhcl_x64<F>(
     sidecar: Option<&mut F>,
     command_line: CommandLineType<'_>,
     mut initrd: Option<(&mut dyn ReadSeek, u64)>,
+    custom_binary: Option<(&mut dyn ReadSeek, u64)>,
     memory_page_base: Option<u64>,
     memory_page_count: u64,
     vtl0_config: Vtl0Config<'_>,
@@ -401,6 +491,15 @@ where
     } else {
         None
     };
+
+    let kexec_payload = import_custom_binary(
+        importer,
+        custom_binary,
+        &mut offset,
+        ramdisk.unwrap_or((0, 0)),
+        memory_start_address,
+        memory_size,
+    )?;
 
     let gdt_base_address = offset;
     let gdt_size = HV_PAGE_SIZE;
@@ -967,7 +1066,8 @@ where
         reserved: [0; 4],
     };
 
-    let region_image = build_measured_vtl2_config_region(vtl2_measured_config, product_policy);
+    let region_image =
+        build_measured_vtl2_config_region(vtl2_measured_config, product_policy, kexec_payload)?;
 
     importer
         .import_pages(
@@ -1031,6 +1131,7 @@ pub fn load_openhcl_arm64<F>(
     shim: &mut F,
     command_line: CommandLineType<'_>,
     mut initrd: Option<(&mut dyn ReadSeek, u64)>,
+    custom_binary: Option<(&mut dyn ReadSeek, u64)>,
     memory_page_base: Option<u64>,
     memory_page_count: u64,
     vtl0_config: Vtl0Config<'_>,
@@ -1241,6 +1342,15 @@ where
         &[],
     )?;
     next_addr += heap_size;
+
+    let kexec_payload = import_custom_binary(
+        importer,
+        custom_binary,
+        &mut next_addr,
+        (initrd_gpa, initrd_size),
+        memory_start_address,
+        memory_size,
+    )?;
 
     // The end of memory used by the loader, excluding pagetables.
     let end_of_underhill_mem = next_addr;
@@ -1544,7 +1654,8 @@ where
         reserved: [0; 4],
     };
 
-    let region_image = build_measured_vtl2_config_region(vtl2_measured_config, product_policy);
+    let region_image =
+        build_measured_vtl2_config_region(vtl2_measured_config, product_policy, kexec_payload)?;
 
     importer
         .import_pages(
@@ -1575,6 +1686,7 @@ mod product_policy_tests {
     use super::*;
     use product_policy::decode_product_policy;
     use product_policy::sivm::SivmPolicy;
+    use test_with_tracing::test;
     use zerocopy::FromBytes;
 
     // ---------------------------------------------------------------
@@ -1632,7 +1744,7 @@ mod product_policy_tests {
     #[test]
     fn build_region_absent_records_zero_size_in_struct() {
         let cfg = empty_config();
-        let region = build_measured_vtl2_config_region(cfg, None);
+        let region = build_measured_vtl2_config_region(cfg, None, None).unwrap();
         assert_eq!(
             region.len(),
             (PARAVISOR_MEASURED_VTL2_CONFIG_SIZE_PAGES as usize) * (HV_PAGE_SIZE as usize)
@@ -1656,7 +1768,7 @@ mod product_policy_tests {
             ..Default::default()
         });
         let bytes = encode_product_policy_bytes(&policy);
-        let region = build_measured_vtl2_config_region(cfg, Some(&policy));
+        let region = build_measured_vtl2_config_region(cfg, Some(&policy), None).unwrap();
         assert_eq!(
             region.len(),
             (PARAVISOR_MEASURED_VTL2_CONFIG_SIZE_PAGES as usize) * (HV_PAGE_SIZE as usize)
@@ -1673,5 +1785,91 @@ mod product_policy_tests {
         .unwrap();
         // Test that the decoded policy matches the original policy
         assert_eq!(decoded, policy);
+    }
+
+    fn payload_descriptor() -> KexecPayloadDescriptor {
+        KexecPayloadDescriptor {
+            magic: KexecPayloadDescriptor::MAGIC,
+            version: KexecPayloadDescriptor::VERSION,
+            reserved: 0,
+            initrd_base: 0x100000,
+            initrd_size: 4097,
+            custom_binary_base: 0x102000,
+            custom_binary_size: 17,
+        }
+    }
+
+    #[test]
+    fn custom_binary_layout_checks_size_alignment_and_overflow() {
+        assert_eq!(custom_binary_end(0x1000, 1).unwrap(), 0x2000);
+        assert_eq!(custom_binary_end(0x1000, 4096).unwrap(), 0x2000);
+        assert_eq!(custom_binary_end(0x1000, 4097).unwrap(), 0x3000);
+        assert!(matches!(
+            custom_binary_end(1, 1),
+            Err(Error::MemoryUnaligned(1))
+        ));
+        assert!(matches!(
+            custom_binary_end(0, 0),
+            Err(Error::InvalidCustomBinarySize(0))
+        ));
+        assert!(matches!(
+            custom_binary_end(0, u64::MAX),
+            Err(Error::InvalidCustomBinarySize(_))
+        ));
+        assert!(matches!(
+            custom_binary_end(!(HV_PAGE_SIZE - 1), 1),
+            Err(Error::CustomBinaryAddressOverflow)
+        ));
+    }
+
+    #[test]
+    fn build_region_descriptor_preserves_policy_and_exact_sizes() {
+        let policy = ProductPolicy::Sivm(SivmPolicy {
+            custom_uefi_json: vec![1, 2, 3],
+            ..Default::default()
+        });
+        for policy in [None, Some(&policy)] {
+            let descriptor = payload_descriptor();
+            let region =
+                build_measured_vtl2_config_region(empty_config(), policy, Some(descriptor))
+                    .unwrap();
+            let legacy = build_measured_vtl2_config_region(empty_config(), policy, None).unwrap();
+            let (config, _) = ParavisorMeasuredVtl2Config::ref_from_prefix(&region).unwrap();
+            let offset = kexec_payload_descriptor_offset(config.product_policy_size).unwrap();
+            assert_eq!(&region[..offset], &legacy[..offset]);
+            let (decoded, tail) =
+                KexecPayloadDescriptor::ref_from_prefix(&region[offset..]).unwrap();
+            assert_eq!(decoded.as_bytes(), descriptor.as_bytes());
+            assert!(tail.iter().all(|&byte| byte == 0));
+        }
+    }
+
+    #[test]
+    fn build_region_descriptor_does_not_reduce_legacy_policy_capacity() {
+        let policy = (0..=PRODUCT_POLICY_MAX_SIZE_BYTES)
+            .rev()
+            .map(|size| {
+                ProductPolicy::Sivm(SivmPolicy {
+                    custom_uefi_json: vec![0; size],
+                    ..Default::default()
+                })
+            })
+            .find(|policy| encode_product_policy(policy).len() <= PRODUCT_POLICY_MAX_SIZE_BYTES)
+            .unwrap();
+        let region =
+            build_measured_vtl2_config_region(empty_config(), Some(&policy), None).unwrap();
+        let (config, _) = ParavisorMeasuredVtl2Config::ref_from_prefix(&region).unwrap();
+        assert_eq!(
+            config.product_policy_size as usize,
+            PRODUCT_POLICY_MAX_SIZE_BYTES
+        );
+        assert!(matches!(
+            build_measured_vtl2_config_region(
+                empty_config(),
+                Some(&policy),
+                Some(payload_descriptor())
+            ),
+            Err(Error::KexecPayloadDescriptorSpace(size)) if size == config.product_policy_size
+        ));
     }
 }
