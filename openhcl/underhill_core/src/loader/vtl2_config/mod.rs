@@ -589,7 +589,7 @@ pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info
     // instance's Vtl2ParamsMap drop (zero_on_drop), so the magic field will
     // be 0. This is expected and we treat it as having no measured config.
     // Any other non-matching magic indicates corruption and should still panic.
-    let kexec_servicing = std::env::var_os("OPENHCL_KEXEC_SERVICING").is_some();
+    let kexec_servicing = crate::servicing::is_kexec_servicing_boot();
     let has_measured_config = if kexec_servicing && measured_config.magic == 0 {
         tracing::debug!(
             CVM_ALLOWED,

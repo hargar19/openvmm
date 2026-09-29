@@ -60,6 +60,12 @@ pub fn kexec_file_load(
     Ok(())
 }
 
+/// Release the kernel staged by `kexec_file_load` after a cancelled servicing operation.
+pub fn kexec_file_unload() -> io::Result<()> {
+    const KEXEC_FILE_UNLOAD: u64 = 0x1;
+    kexec_file_load(-1, -1, c"", KEXEC_FILE_UNLOAD)
+}
+
 /// Trigger a kexec reboot into the previously staged kernel.
 ///
 /// This is equivalent to `kexec -e` / `reboot(LINUX_REBOOT_CMD_KEXEC)`.

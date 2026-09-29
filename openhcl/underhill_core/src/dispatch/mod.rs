@@ -28,6 +28,7 @@ use futures::FutureExt;
 use futures::StreamExt;
 use futures_concurrency::future::Join;
 use get_protocol::SaveGuestVtl2StateFlags;
+use guest_emulation_transport::api::GuestDrivenServicingRequest;
 use guest_emulation_transport::api::GuestSaveRequest;
 use guid::Guid;
 use hyperv_ic_resources::shutdown::ShutdownParams;
@@ -262,6 +263,12 @@ impl LoadedVm {
             .await
             .expect("no failure");
 
+        let mut guest_driven_recv = self
+            .get_client
+            .take_guest_driven_servicing_recv()
+            .await
+            .expect("receiver is only taken once");
+
         struct PendingShutdown {
             guest_response: PendingRpc<ShutdownResult>,
             send_result: Rpc<(), ShutdownResult>,
@@ -278,6 +285,7 @@ impl LoadedVm {
                 UhVmRpc(UhVmRpc),
                 VtlCrash(VtlCrash),
                 ServicingRequest(GuestSaveRequest),
+                GuestDrivenServicing(GuestDrivenServicingRequest),
                 ShutdownRequest(Rpc<ShutdownParams, ShutdownResult>),
                 ShutdownResponse(<PendingRpc<ShutdownResult> as Future>::Output),
                 VpciRelayReady,
@@ -289,6 +297,7 @@ impl LoadedVm {
                 message = vm_rpc.select_next_some() => Event::UhVmRpc(message),
                 message = self.crash_notification_recv.select_next_some() => Event::VtlCrash(message),
                 message = save_request_recv.select_next_some() => Event::ServicingRequest(message),
+                message = guest_driven_recv.select_next_some() => Event::GuestDrivenServicing(message),
                 _ = async {
                     if let Some(vpci_relay) = &mut self.vpci_relay {
                         vpci_relay.wait_ready().await
@@ -501,6 +510,24 @@ impl LoadedVm {
                         }
                     }
                 }
+                Event::GuestDrivenServicing(message) => {
+                    let correlation_id = message.correlation_id;
+                    let result = if pending_shutdown_response.is_some() {
+                        drop(message);
+                        tracelimit::warn_ratelimited!(CVM_ALLOWED, %correlation_id, "ignoring servicing during shutdown");
+                        Ok(())
+                    } else {
+                        self.handle_guest_driven_servicing(message).await
+                    };
+                    self.get_client
+                        .finish_guest_driven_servicing(correlation_id)
+                        .await;
+                    if let Err(err) = result {
+                        tracing::error!(CVM_ALLOWED, %correlation_id, error = %format!("{err:#}"),
+                            "guest-driven servicing failed after device shutdown; terminating worker");
+                        break None;
+                    }
+                }
                 Event::ShutdownRequest(rpc) => {
                     if pending_shutdown_response.is_some() {
                         rpc.complete(ShutdownResult::AlreadyInProgress);
@@ -597,25 +624,17 @@ impl LoadedVm {
             std::future::pending::<()>().await;
         }
 
-        // Build the initramfs and stage the kernel before stopping the VM so
-        // preparation does not contribute to blackout time.
-        let kexec_enabled = capabilities_flags.enable_kexec()
-            || std::env::var_os("OPENHCL_SERVICING_RESTART_VIA_KEXEC").is_some();
-        let staged_online_cpus = self.prepare_kexec_if_enabled(correlation_id, kexec_enabled);
-
         let running = self.state_units.is_running();
+        let mut devices_shutdown = false;
         let success = match self
-            .handle_servicing_inner(correlation_id, deadline, capabilities_flags)
+            .handle_servicing_inner(
+                correlation_id,
+                deadline,
+                capabilities_flags,
+                &mut devices_shutdown,
+            )
             .await
-            .and_then(|state| {
-                if let Some(TestScenarioConfig::SaveFail) = self.test_configuration {
-                    tracing::info!(
-                        "Test configuration SERVICING_SAVE_FAIL is set. Failing the save."
-                    );
-                    return Err(anyhow::anyhow!("Simulated servicing save failure"));
-                }
-                Ok(state)
-            }) {
+        {
             Ok(state) => {
                 let state_buf = mesh::payload::encode(state);
                 tracing::info!(
@@ -624,15 +643,6 @@ impl LoadedVm {
                     saved_state_len = state_buf.len(),
                     "servicing save completed; preparing to send state to host"
                 );
-
-                // This hook runs BEFORE sending state to the host.  The state
-                // is persisted into a reserved memory region so the kexec'd
-                // VTL2 can read it back.  If kexec succeeds (exec never
-                // returns), the NEW VTL2 instance will send the state to the
-                // host to complete the save protocol.  If kexec fails (script
-                // missing, exec error, etc.), we fall through and send state
-                // normally for the host-driven reload path.
-                self.try_kexec_after_servicing(correlation_id, &state_buf, staged_online_cpus);
 
                 tracing::info!(
                     CVM_ALLOWED,
@@ -659,6 +669,9 @@ impl LoadedVm {
                     .await
                     .context("failed to notify host of servicing-while-paused failure")?;
 
+                if devices_shutdown {
+                    return Err(err.context("servicing failed after device shutdown"));
+                }
                 if running {
                     self.start(Some(correlation_id)).await;
                 }
@@ -669,117 +682,99 @@ impl LoadedVm {
         Ok(success)
     }
 
-    /// Prepare kexec if the feature is enabled.  Runs BEFORE VM stop so that
-    /// the initramfs build and `kexec_file_load` do not contribute to blackout
-    /// time. Returns `true` if the kernel is staged and ready for kexec.
-    fn prepare_kexec_if_enabled(&self, correlation_id: Guid, enabled: bool) -> Option<String> {
-        if !enabled {
-            return None;
+    async fn handle_guest_driven_servicing(
+        &mut self,
+        request: GuestDrivenServicingRequest,
+    ) -> anyhow::Result<()> {
+        let GuestDrivenServicingRequest {
+            correlation_id,
+            igvm_data,
+        } = request;
+        if self.isolation.is_isolated()
+            || cfg!(not(guest_arch = "x86_64"))
+            || !self.state_units.is_running()
+        {
+            tracelimit::warn_ratelimited!(CVM_ALLOWED, %correlation_id,
+                "guest-driven servicing requires a running non-isolated x64 VM");
+            return Ok(());
         }
 
-        if cfg!(not(guest_arch = "x86_64")) {
-            tracing::error!(
-                CVM_ALLOWED,
-                %correlation_id,
-                "kexec servicing is only supported for x86_64 guests"
-            );
-            return None;
-        }
-
-        tracing::info!(
-            CVM_ALLOWED,
-            %correlation_id,
-            "preparing kexec before VM stop (guest still running)"
-        );
-
-        let prepare_result = kexec_prepare::prepare_kexec();
-
-        match prepare_result {
-            Ok(online_cpus) => {
-                tracing::info!(CVM_ALLOWED, %correlation_id, "kexec prepare completed");
-                Some(online_cpus)
-            }
+        let staged = kexec_prepare::prepare_kexec(&igvm_data);
+        drop(igvm_data);
+        let online_cpus = match staged {
+            Ok(online_cpus) => online_cpus,
             Err(err) => {
-                tracing::error!(
-                    CVM_ALLOWED,
-                    %correlation_id,
-                    error = format!("{err:#}").as_str(),
-                    "kexec prepare failed; will fall back to host restart after save"
-                );
-                None
+                tracelimit::error_ratelimited!(CVM_ALLOWED, %correlation_id, error = %format!("{err:#}"),
+                    "guest-driven staging failed; VM remains running");
+                return Ok(());
             }
+        };
+        tracing::info!(CVM_ALLOWED, %correlation_id, "incoming IGVM staged before VM stop");
+
+        let mut devices_shutdown = false;
+        let nvme_keep_alive = self.nvme_keep_alive.clone();
+        let mana_keep_alive = self.mana_keep_alive.clone();
+        let deadline = std::time::Instant::now() + Duration::from_secs(200);
+        let result = self
+            .handle_servicing_inner(
+                correlation_id,
+                deadline,
+                SaveGuestVtl2StateFlags::new(),
+                &mut devices_shutdown,
+            )
+            .await;
+        let state = match result {
+            Ok(state) => state,
+            Err(err) => {
+                if let Err(unload_err) = kexec_sys::kexec_file_unload() {
+                    tracing::error!(CVM_ALLOWED, error = %unload_err, "failed to unload staged kernel");
+                    return Err(err.context("failed to cancel staged kexec"));
+                }
+                if devices_shutdown {
+                    return Err(err);
+                }
+                self.nvme_keep_alive = nvme_keep_alive;
+                self.mana_keep_alive = mana_keep_alive;
+                self.start(Some(correlation_id)).await;
+                tracelimit::error_ratelimited!(CVM_ALLOWED, %correlation_id, error = %format!("{err:#}"),
+                    "guest-driven save failed; VM resumed");
+                return Ok(());
+            }
+        };
+        let state_buf = mesh::payload::encode(state);
+        let result = self.kexec_after_servicing(correlation_id, &state_buf, &online_cpus);
+        if let Err(err) = kexec_sys::kexec_file_unload() {
+            tracing::error!(CVM_ALLOWED, error = %err, "failed to unload kernel after kexec failure");
         }
+        if let Err(err) = crate::loader::vtl2_config::clear_servicing_state_from_persisted(
+            self.runtime_params.parsed_openhcl_boot(),
+        ) {
+            tracing::error!(CVM_ALLOWED, error = %err, "failed to clear state after kexec failure");
+        }
+        result
     }
 
-    fn try_kexec_after_servicing(
+    fn kexec_after_servicing(
         &self,
         correlation_id: Guid,
         state_buf: &[u8],
-        staged_online_cpus: Option<String>,
-    ) {
-        let Some(staged_online_cpus) = staged_online_cpus else {
-            return;
-        };
-
-        // Persist the servicing state into the reserved memory region so the
-        // next instance can read it back without involving the host.
+        staged_online_cpus: &str,
+    ) -> anyhow::Result<()> {
         let parsed = self.runtime_params.parsed_openhcl_boot();
-        if let Err(err) =
-            crate::loader::vtl2_config::write_servicing_state_to_persisted(parsed, state_buf)
-        {
-            tracing::error!(
-                CVM_ALLOWED,
-                %correlation_id,
-                error = err.as_ref() as &dyn std::error::Error,
-                "failed to persist servicing state for kexec; falling back to host restart"
+        crate::loader::vtl2_config::write_servicing_state_to_persisted(parsed, state_buf)
+            .context("failed to persist servicing state for kexec")?;
+        self.partition
+            .prepare_sidecar_for_kexec()
+            .context("sidecar is not ready for kexec")?;
+        let result = (|| {
+            let current_online_cpus = kexec_prepare::online_cpu_mask()?;
+            anyhow::ensure!(
+                current_online_cpus == staged_online_cpus,
+                "CPU ownership changed after kexec staging: {staged_online_cpus} -> {current_online_cpus}"
             );
-            return;
-        }
-
-        if let Err(err) = self.partition.prepare_sidecar_for_kexec() {
-            tracing::error!(
-                CVM_ALLOWED,
-                %correlation_id,
-                error = &err as &dyn std::error::Error,
-                "sidecar is not ready for kexec; falling back to host restart"
-            );
-            return;
-        }
-
-        let current_online_cpus = match kexec_prepare::online_cpu_mask() {
-            Ok(mask) => mask,
-            Err(err) => {
-                let _ = self.partition.cancel_sidecar_kexec();
-                tracing::error!(
-                    CVM_ALLOWED,
-                    %correlation_id,
-                    error = err.as_ref() as &dyn std::error::Error,
-                    "failed to verify CPU ownership for kexec; falling back to host restart"
-                );
-                return;
-            }
-        };
-        if current_online_cpus != staged_online_cpus {
-            let _ = self.partition.cancel_sidecar_kexec();
-            tracing::error!(
-                CVM_ALLOWED,
-                %correlation_id,
-                %staged_online_cpus,
-                %current_online_cpus,
-                "CPU ownership changed after kexec staging; falling back to host restart"
-            );
-            return;
-        }
-
-        tracing::info!(
-            CVM_ALLOWED,
-            %correlation_id,
-            "servicing save completed; triggering kexec reboot"
-        );
-
-        // kexec_reboot() calls reboot(LINUX_REBOOT_CMD_KEXEC).
-        // If successful, this never returns.
-        let err = kexec_sys::kexec_reboot();
+            tracing::info!(CVM_ALLOWED, %correlation_id, saved_state_len = state_buf.len(), "triggering guest-driven kexec reboot");
+            Err(anyhow::Error::from(kexec_sys::kexec_reboot()).context("kexec reboot failed"))
+        })();
         if let Err(cancel_err) = self.partition.cancel_sidecar_kexec() {
             tracing::error!(
                 CVM_ALLOWED,
@@ -788,12 +783,7 @@ impl LoadedVm {
                 "failed to cancel sidecar kexec preparation"
             );
         }
-        tracing::error!(
-            CVM_ALLOWED,
-            %correlation_id,
-            error = &err as &dyn std::error::Error,
-            "kexec reboot failed; falling back to host restart"
-        );
+        result
     }
 
     async fn handle_servicing_inner(
@@ -801,6 +791,7 @@ impl LoadedVm {
         correlation_id: Guid,
         deadline: std::time::Instant,
         capabilities_flags: SaveGuestVtl2StateFlags,
+        devices_shutdown: &mut bool,
     ) -> anyhow::Result<ServicingState> {
         if self.isolation.is_isolated() {
             anyhow::bail!("Servicing is not yet supported for isolated VMs");
@@ -876,6 +867,10 @@ impl LoadedVm {
                 .await?;
             state.init_state.correlation_id = Some(correlation_id);
 
+            if let Some(TestScenarioConfig::SaveFail) = self.test_configuration {
+                anyhow::bail!("Simulated servicing save failure");
+            }
+
             // Unload any network devices.
             let shutdown_mana = async {
                 if let Some(network_settings) = self.network_settings.as_mut() {
@@ -926,6 +921,7 @@ impl LoadedVm {
             )
             .context("failed to write persisted info")?;
 
+            *devices_shutdown = true;
             let (r, (), ()) = (shutdown_pci, shutdown_mana, shutdown_nvme).join().await;
             r?;
 
@@ -937,7 +933,9 @@ impl LoadedVm {
         let mut state = match r {
             Ok(state) => state,
             Err(err) => {
-                self.resume_drivers();
+                if !*devices_shutdown {
+                    self.resume_drivers();
+                }
                 return Err(err);
             }
         };

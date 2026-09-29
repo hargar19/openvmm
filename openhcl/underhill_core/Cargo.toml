@@ -166,13 +166,13 @@ anyhow.workspace = true
 async-trait.workspace = true
 blocking.workspace = true
 cfg-if.workspace = true
-flate2.workspace = true
 fs-err.workspace = true
 futures-concurrency.workspace = true
 futures.workspace = true
 getrandom.workspace = true
 jiff.workspace = true
 libc.workspace = true
+object = { workspace = true, features = ["elf", "std", "read_core"] }
 parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_helpers.workspace = true

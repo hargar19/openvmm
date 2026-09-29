@@ -9,6 +9,29 @@ use crate::worker::FirmwareType;
 use anyhow::Context as _;
 use vmcore::save_restore::SavedStateBlob;
 
+pub(crate) fn is_kexec_servicing_boot() -> bool {
+    kexec_servicing_marker(std::env::var_os("OPENHCL_KEXEC_SERVICING").as_deref())
+}
+
+fn kexec_servicing_marker(value: Option<&std::ffi::OsStr>) -> bool {
+    value == Some(std::ffi::OsStr::new("1"))
+}
+
+#[cfg(test)]
+mod kexec_boot_tests {
+    use super::kexec_servicing_marker;
+    use std::ffi::OsStr;
+    use test_with_tracing::test;
+
+    #[test]
+    fn only_explicit_kexec_marker_disables_cold_boot() {
+        assert!(kexec_servicing_marker(Some(OsStr::new("1"))));
+        for value in [None, Some(""), Some("0"), Some("true"), Some("1 ")] {
+            assert!(!kexec_servicing_marker(value.map(OsStr::new)));
+        }
+    }
+}
+
 mod state {
     use mana_driver::save_restore::ManaSavedState;
     use mesh::payload::Protobuf;

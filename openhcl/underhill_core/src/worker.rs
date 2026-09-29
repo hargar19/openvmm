@@ -386,7 +386,8 @@ impl Worker for UnderhillVmWorker {
 
             let get_client = get_infra.get_client.clone();
 
-            let result = Self::new_or_restart(get_infra, params, true, None, driver).await;
+            let boot_init = !servicing::is_kexec_servicing_boot();
+            let result = Self::new_or_restart(get_infra, params, boot_init, None, driver).await;
 
             if let Err(err) = &result {
                 tracing::error!(
@@ -515,7 +516,7 @@ impl UnderhillVmWorker {
         // In a host-driven servicing scenario, saved state comes from the host.
         // After kexec, it comes from the persisted VTL2 memory region.
         let servicing_state_from_host = dps.general.is_servicing_scenario;
-        let kexec_servicing = std::env::var_os("OPENHCL_KEXEC_SERVICING").is_some();
+        let kexec_servicing = servicing::is_kexec_servicing_boot();
         let mut restored_state_from_host = false;
 
         if servicing_state_from_host || kexec_servicing {
