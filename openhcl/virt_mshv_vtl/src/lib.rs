@@ -873,6 +873,16 @@ struct ExitActivity {
 
 /// Immutable access to useful bits of Partition state.
 impl UhPartition {
+    /// Verify that sidecar VPs are idle and block new sidecar operations.
+    pub fn prepare_sidecar_for_kexec(&self) -> Result<(), sidecar_client::SidecarError> {
+        self.inner.hcl.prepare_sidecar_for_kexec()
+    }
+
+    /// Cancel sidecar kexec preparation after a failed reboot attempt.
+    pub fn cancel_sidecar_kexec(&self) -> Result<(), sidecar_client::SidecarError> {
+        self.inner.hcl.cancel_sidecar_kexec()
+    }
+
     /// Revokes guest VSM.
     pub fn revoke_guest_vsm(&self) -> Result<(), RevokeGuestVsmError> {
         fn revoke<T: Inspect>(vsm_state: &mut GuestVsmState<T>) -> Result<(), RevokeGuestVsmError> {

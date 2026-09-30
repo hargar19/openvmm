@@ -1984,6 +1984,22 @@ impl Hcl {
         self.sidecar.is_some()
     }
 
+    /// Verify that sidecar VPs are idle and block new sidecar operations.
+    pub fn prepare_sidecar_for_kexec(&self) -> Result<(), sidecar_client::SidecarError> {
+        if let Some(sidecar) = &self.sidecar {
+            sidecar.prepare_for_kexec()?;
+        }
+        Ok(())
+    }
+
+    /// Cancel sidecar kexec preparation after a failed reboot attempt.
+    pub fn cancel_sidecar_kexec(&self) -> Result<(), sidecar_client::SidecarError> {
+        if let Some(sidecar) = &self.sidecar {
+            sidecar.cancel_kexec()?;
+        }
+        Ok(())
+    }
+
     /// Create a VP runner for the given partition.
     pub fn runner<'a, T: Backing<'a>>(
         &'a self,
