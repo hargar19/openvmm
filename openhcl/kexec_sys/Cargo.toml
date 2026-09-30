@@ -1,0 +1,13 @@
+# Copyright (c) Microsoft Corporation.
+# Licensed under the MIT License.
+
+[package]
+name = "kexec_sys"
+edition.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

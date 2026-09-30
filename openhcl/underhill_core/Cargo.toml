@@ -70,6 +70,7 @@ guest_emulation_transport.workspace = true
 ide.workspace = true
 ide_resources.workspace = true
 input_core.workspace = true
+kexec_sys.workspace = true
 kmsg_defs.workspace = true
 kmsg_writer.workspace = true
 hcl.workspace = true
@@ -171,6 +172,7 @@ futures.workspace = true
 getrandom.workspace = true
 jiff.workspace = true
 libc.workspace = true
+object = { workspace = true, features = ["elf", "std", "read_core"] }
 parking_lot.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_helpers.workspace = true
