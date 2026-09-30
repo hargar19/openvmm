@@ -133,6 +133,9 @@ enum Options {
         /// file.
         #[clap(short, long = "resources")]
         resources: PathBuf,
+        /// Raw binary to embed as a measured VTL2 kexec payload, overriding the resource file.
+        #[clap(long)]
+        custom_binary: Option<PathBuf>,
         /// Output file path for the built igvm file
         #[clap(short = 'o', long)]
         output: PathBuf,
@@ -334,6 +337,7 @@ fn main() -> anyhow::Result<()> {
         Options::Manifest {
             manifest,
             resources,
+            custom_binary,
             output,
             debug_validation,
             disable_secure_avic,
@@ -369,10 +373,19 @@ fn main() -> anyhow::Result<()> {
 
             // Read resources and validate that it covers the required resources
             // from the config.
-            let resources: Resources = serde_json::from_str(
+            let mut resources: Resources = serde_json::from_str(
                 &fs_err::read_to_string(resources).context("reading resources")?,
             )
             .context("parsing resources")?;
+
+            if let Some(custom_binary) = custom_binary {
+                let mut paths = resources.resources().clone();
+                paths.insert(
+                    ResourceType::CustomBinary,
+                    std::path::absolute(custom_binary).context("resolving custom binary path")?,
+                );
+                resources = Resources::new(paths)?;
+            }
 
             let required_resources = config.required_resources();
             resources
@@ -1288,6 +1301,7 @@ trait IgvmfilegenRegister: IgvmLoaderRegister + 'static {
         sidecar: Option<&mut F>,
         command_line: CommandLineType<'_>,
         initrd: Option<(&mut dyn loader::common::ReadSeek, u64)>,
+        custom_binary: Option<(&mut dyn loader::common::ReadSeek, u64)>,
         memory_page_base: Option<u64>,
         memory_page_count: u64,
         vtl0_config: Vtl0Config<'_>,
@@ -1337,6 +1351,7 @@ impl IgvmfilegenRegister for X86Register {
         sidecar: Option<&mut F>,
         command_line: CommandLineType<'_>,
         initrd: Option<(&mut dyn loader::common::ReadSeek, u64)>,
+        custom_binary: Option<(&mut dyn loader::common::ReadSeek, u64)>,
         memory_page_base: Option<u64>,
         memory_page_count: u64,
         vtl0_config: Vtl0Config<'_>,
@@ -1352,6 +1367,7 @@ impl IgvmfilegenRegister for X86Register {
             sidecar,
             command_line,
             initrd,
+            custom_binary,
             memory_page_base,
             memory_page_count,
             vtl0_config,
@@ -1401,6 +1417,7 @@ impl IgvmfilegenRegister for Aarch64Register {
         _sidecar: Option<&mut F>,
         command_line: CommandLineType<'_>,
         initrd: Option<(&mut dyn loader::common::ReadSeek, u64)>,
+        custom_binary: Option<(&mut dyn loader::common::ReadSeek, u64)>,
         memory_page_base: Option<u64>,
         memory_page_count: u64,
         vtl0_config: Vtl0Config<'_>,
@@ -1415,6 +1432,7 @@ impl IgvmfilegenRegister for Aarch64Register {
             shim,
             command_line,
             initrd,
+            custom_binary,
             memory_page_base,
             memory_page_count,
             vtl0_config,
@@ -1496,6 +1514,21 @@ fn load_image<'a, R: IgvmfilegenRegister + GuestArch + 'static>(
                 None
             };
 
+            let mut custom_binary = resources
+                .get(ResourceType::CustomBinary)
+                .map(|path| {
+                    fs_err::File::open(path)
+                        .with_context(|| format!("reading custom binary at {}", path.display()))
+                })
+                .transpose()?;
+            let custom_binary_info = custom_binary
+                .as_mut()
+                .map(|file| {
+                    let size = file.metadata().context("getting custom binary size")?.len();
+                    Ok::<_, anyhow::Error>((file as &mut dyn loader::common::ReadSeek, size))
+                })
+                .transpose()?;
+
             // TODO: While the paravisor supports multiple things that can be
             // loaded in VTL0, we don't yet have updated file builder config for
             // that.
@@ -1543,6 +1576,7 @@ fn load_image<'a, R: IgvmfilegenRegister + GuestArch + 'static>(
                 sidecar.as_mut(),
                 command_line,
                 initrd_info,
+                custom_binary_info,
                 memory_page_base,
                 memory_page_count,
                 vtl0_load_config,
@@ -1614,6 +1648,270 @@ fn load_linux<R: IgvmfilegenRegister + GuestArch + 'static>(
     let load_info = R::load_linux_kernel_and_initrd(loader, &mut kernel, 0, initrd, None)
         .context("loading linux kernel and initrd")?;
     Ok(load_info)
+}
+
+#[cfg(test)]
+mod custom_binary_tests {
+    use super::*;
+    use hvdef::HV_PAGE_SIZE;
+    use igvm::IgvmDirectiveHeader;
+    use loader_defs::paravisor::KexecPayloadDescriptor;
+    use loader_defs::paravisor::ParavisorMeasuredVtl2Config;
+    use loader_defs::paravisor::kexec_payload_descriptor_offset;
+    use object::LittleEndian;
+    use object::elf;
+    use std::io::Cursor;
+    use test_with_tracing::test;
+
+    #[repr(C)]
+    #[derive(IntoBytes, zerocopy::Immutable)]
+    struct TestArm64ImageHeader {
+        code: [u32; 2],
+        text_offset: u64,
+        image_size: u64,
+        flags: u64,
+        reserved: [u64; 3],
+        magic: [u8; 4],
+        pe_offset: u32,
+    }
+
+    fn test_elf(machine: u16) -> Vec<u8> {
+        let header = elf::FileHeader64 {
+            e_ident: elf::Ident {
+                magic: elf::ELFMAG,
+                class: elf::ELFCLASS64,
+                data: elf::ELFDATA2LSB,
+                version: elf::EV_CURRENT,
+                os_abi: 0,
+                abi_version: 0,
+                padding: [0; 7],
+            },
+            e_type: object::U16::new(LittleEndian, elf::ET_EXEC),
+            e_machine: object::U16::new(LittleEndian, machine),
+            e_version: object::U32::new(LittleEndian, elf::EV_CURRENT.into()),
+            e_entry: object::U64::new(LittleEndian, 0),
+            e_phoff: object::U64::new(
+                LittleEndian,
+                size_of::<elf::FileHeader64<LittleEndian>>() as u64,
+            ),
+            e_shoff: object::U64::new(LittleEndian, 0),
+            e_flags: object::U32::new(LittleEndian, 0),
+            e_ehsize: object::U16::new(
+                LittleEndian,
+                size_of::<elf::FileHeader64<LittleEndian>>() as u16,
+            ),
+            e_phentsize: object::U16::new(
+                LittleEndian,
+                size_of::<elf::ProgramHeader64<LittleEndian>>() as u16,
+            ),
+            e_phnum: object::U16::new(LittleEndian, 1),
+            e_shentsize: object::U16::new(LittleEndian, 0),
+            e_shnum: object::U16::new(LittleEndian, 0),
+            e_shstrndx: object::U16::new(LittleEndian, 0),
+        };
+        let segment = elf::ProgramHeader64 {
+            p_type: object::U32::new(LittleEndian, elf::PT_LOAD),
+            p_flags: object::U32::new(LittleEndian, elf::PF_R | elf::PF_X),
+            p_offset: object::U64::new(LittleEndian, 0),
+            p_vaddr: object::U64::new(LittleEndian, 0),
+            p_paddr: object::U64::new(LittleEndian, 0),
+            p_filesz: object::U64::new(LittleEndian, HV_PAGE_SIZE),
+            p_memsz: object::U64::new(LittleEndian, HV_PAGE_SIZE),
+            p_align: object::U64::new(LittleEndian, HV_PAGE_SIZE),
+        };
+        let mut bytes = object::pod::bytes_of(&header).to_vec();
+        bytes.extend_from_slice(object::pod::bytes_of(&segment));
+        bytes.resize(HV_PAGE_SIZE as usize, 0);
+        bytes
+    }
+
+    fn test_image<R: IgvmfilegenRegister + GuestArch>(
+        binary: Option<&[u8]>,
+        initrd_bytes: &[u8],
+        isolation_type: LoaderIsolationType,
+    ) -> Result<IgvmFile, loader::paravisor::Error> {
+        let (kernel_bytes, machine) = match R::arch() {
+            GuestArchKind::X86_64 => (test_elf(elf::EM_X86_64), elf::EM_X86_64),
+            GuestArchKind::Aarch64 => {
+                let header = TestArm64ImageHeader {
+                    code: [0; 2],
+                    text_offset: 0,
+                    image_size: HV_PAGE_SIZE,
+                    flags: 0b1010,
+                    reserved: [0; 3],
+                    magic: *b"ARM\x64",
+                    pe_offset: 0,
+                };
+                let mut bytes = header.as_bytes().to_vec();
+                bytes.resize(HV_PAGE_SIZE as usize, 0);
+                (bytes, elf::EM_AARCH64)
+            }
+        };
+        let mut kernel = Cursor::new(kernel_bytes);
+        let mut shim = Cursor::new(test_elf(machine));
+        let mut initrd = Cursor::new(initrd_bytes);
+        let mut binary_file = binary.map(Cursor::new);
+        let custom_binary = binary_file.as_mut().map(|file| {
+            let size = file.get_ref().len() as u64;
+            (file as &mut dyn loader::common::ReadSeek, size)
+        });
+        let mut loader = IgvmLoader::<R>::new(true, isolation_type);
+        let command_line = c"".to_owned();
+        R::load_openhcl(
+            &mut loader.loader(),
+            &mut kernel,
+            &mut shim,
+            None,
+            CommandLineType::Static(""),
+            Some((&mut initrd, initrd_bytes.len() as u64)),
+            custom_binary,
+            None,
+            loader_defs::paravisor::PARAVISOR_DEFAULT_MEMORY_PAGE_COUNT,
+            Vtl0Config {
+                supports_pcat: false,
+                supports_uefi: None,
+                supports_linux: Some(Vtl0Linux {
+                    command_line: &command_line,
+                    load_info: loader::linux::LoadInfo {
+                        kernel: loader::linux::KernelInfo {
+                            gpa: 0,
+                            size: 0,
+                            entrypoint: 0,
+                        },
+                        initrd: None,
+                        dtb: None,
+                        bzimage_setup_header: None,
+                    },
+                }),
+            },
+            None,
+        )?;
+        Ok(loader.finalize().unwrap().guest)
+    }
+
+    fn measured_config_page(image: &IgvmFile) -> &[u8] {
+        image
+            .directives()
+            .iter()
+            .find_map(|directive| match directive {
+                IgvmDirectiveHeader::PageData { flags, data, .. }
+                    if data.starts_with(&ParavisorMeasuredVtl2Config::MAGIC.to_le_bytes()) =>
+                {
+                    assert!(!flags.unmeasured());
+                    Some(data.as_slice())
+                }
+                _ => None,
+            })
+            .unwrap()
+    }
+
+    fn check_payload_pages(image: &IgvmFile, base: u64, bytes: &[u8]) {
+        assert_eq!(base % HV_PAGE_SIZE, 0);
+        for (index, chunk) in bytes.chunks(HV_PAGE_SIZE as usize).enumerate() {
+            let page = image.directives().iter().find(|directive| matches!(
+                directive,
+                IgvmDirectiveHeader::PageData { gpa, .. } if *gpa == base + index as u64 * HV_PAGE_SIZE
+            )).unwrap();
+            let IgvmDirectiveHeader::PageData { flags, data, .. } = page else {
+                unreachable!()
+            };
+            assert!(!flags.unmeasured());
+            assert!(!flags.shared());
+            assert_eq!(&data[..chunk.len()], chunk);
+            assert!(data[chunk.len()..].iter().all(|&byte| byte == 0));
+        }
+    }
+
+    fn check_custom_binary<R: IgvmfilegenRegister + GuestArch>() {
+        let binary = vec![0xa5; HV_PAGE_SIZE as usize + 17];
+        let initrd = vec![0x5a; HV_PAGE_SIZE as usize + 13];
+        let image = test_image::<R>(Some(&binary), &initrd, LoaderIsolationType::None).unwrap();
+        let page = measured_config_page(&image);
+        let (config, _) = ParavisorMeasuredVtl2Config::read_from_prefix(page).unwrap();
+        let offset = kexec_payload_descriptor_offset(config.product_policy_size).unwrap();
+        let (descriptor, _) = KexecPayloadDescriptor::read_from_prefix(&page[offset..]).unwrap();
+        assert_eq!(descriptor.magic, KexecPayloadDescriptor::MAGIC);
+        assert_eq!(descriptor.version, KexecPayloadDescriptor::VERSION);
+        assert_eq!(descriptor.reserved, 0);
+        assert_eq!(descriptor.custom_binary_size, binary.len() as u64);
+        assert_eq!(descriptor.initrd_size, initrd.len() as u64);
+        check_payload_pages(&image, descriptor.custom_binary_base, &binary);
+        check_payload_pages(&image, descriptor.initrd_base, &initrd);
+        let legacy = test_image::<R>(None, &initrd, LoaderIsolationType::None).unwrap();
+        assert!(
+            measured_config_page(&legacy)[offset..]
+                .iter()
+                .all(|&byte| byte == 0)
+        );
+        assert!(matches!(
+            test_image::<R>(Some(&[]), &initrd, LoaderIsolationType::None),
+            Err(loader::paravisor::Error::InvalidCustomBinarySize(0))
+        ));
+        assert!(matches!(
+            test_image::<R>(Some(&binary), &[], LoaderIsolationType::None),
+            Err(loader::paravisor::Error::CustomBinaryRequiresInitrd)
+        ));
+    }
+
+    #[test]
+    fn custom_binary_x64_measured_pages_and_descriptor() {
+        check_custom_binary::<X86Register>();
+    }
+
+    #[test]
+    fn custom_binary_arm64_measured_pages_and_descriptor() {
+        check_custom_binary::<Aarch64Register>();
+    }
+
+    #[test]
+    fn custom_binary_cvm_pages_are_measured() {
+        for isolation_type in [
+            LoaderIsolationType::Snp {
+                shared_gpa_boundary_bits: Some(39),
+                policy: SnpPolicy::from((1 << 17) | (1 << 16) | 0x1f),
+                injection_type: vp_context_builder::snp::InjectionType::Restricted,
+                secure_avic: vp_context_builder::snp::SecureAvic::Enabled,
+            },
+            LoaderIsolationType::Tdx {
+                policy: TdxPolicy::new(),
+            },
+        ] {
+            let binary = vec![0xa5; HV_PAGE_SIZE as usize + 17];
+            let image =
+                test_image::<X86Register>(Some(&binary), &[0x5a; 13], isolation_type).unwrap();
+            let page = measured_config_page(&image);
+            let offset = kexec_payload_descriptor_offset(0).unwrap();
+            let (descriptor, _) =
+                KexecPayloadDescriptor::read_from_prefix(&page[offset..]).unwrap();
+            assert_eq!(descriptor.magic, KexecPayloadDescriptor::MAGIC);
+            check_payload_pages(&image, descriptor.custom_binary_base, &binary);
+        }
+    }
+
+    #[test]
+    fn manifest_accepts_optional_custom_binary() {
+        let args = [
+            "igvmfilegen",
+            "manifest",
+            "--manifest",
+            "config.json",
+            "--resources",
+            "resources.json",
+            "--output",
+            "out.igvm",
+        ];
+        let Options::Manifest { custom_binary, .. } = Options::try_parse_from(args).unwrap() else {
+            panic!("expected manifest command");
+        };
+        assert!(custom_binary.is_none());
+        let Options::Manifest { custom_binary, .. } =
+            Options::try_parse_from(args.into_iter().chain(["--custom-binary", "payload.bin"]))
+                .unwrap()
+        else {
+            panic!("expected manifest command");
+        };
+        assert_eq!(custom_binary, Some(PathBuf::from("payload.bin")));
+    }
 }
 
 #[cfg(test)]

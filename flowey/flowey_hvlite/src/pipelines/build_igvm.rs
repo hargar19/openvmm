@@ -186,6 +186,10 @@ pub struct BuildIgvmCliCustomizations {
     #[clap(long)]
     pub custom_directory: Vec<PathBuf>,
 
+    /// Path to a raw binary to embed as a measured VTL2 kexec payload.
+    #[clap(long)]
+    pub custom_binary: Option<PathBuf>,
+
     /// Additional rootfs.config files to use to generate the initrd
     #[clap(long)]
     pub custom_extra_rootfs: Vec<PathBuf>,
@@ -329,6 +333,7 @@ impl IntoPipeline for BuildIgvmCli {
                     custom_vtl0_kernel,
                     custom_layer,
                     custom_directory,
+                    custom_binary,
                     with_sidecar,
                     custom_sidecar,
                     mut custom_extra_rootfs,
@@ -476,6 +481,7 @@ impl IntoPipeline for BuildIgvmCli {
                 custom_vtl0_kernel,
                 custom_layer,
                 custom_directory,
+                custom_binary,
             },
         })
         .finish();

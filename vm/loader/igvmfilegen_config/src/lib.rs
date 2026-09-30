@@ -304,6 +304,8 @@ pub enum ResourceType {
     OpenhclBoot,
     UnderhillInitrd,
     UnderhillSidecar,
+    /// Raw measured VTL2 kexec payload paired with the OpenHCL initrd.
+    CustomBinary,
     LinuxKernel,
     LinuxInitrd,
     SnpBootshim,

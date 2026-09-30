@@ -314,6 +314,7 @@ pub struct OpenhclIgvmRecipeDetailsLocalOnly {
     pub custom_openhcl_boot: Option<PathBuf>,
     pub custom_kernel: Option<PathBuf>,
     pub custom_sidecar: Option<PathBuf>,
+    pub custom_binary: Option<PathBuf>,
     pub custom_extra_rootfs: Vec<PathBuf>,
 }
 
@@ -649,6 +650,7 @@ impl SimpleFlowNode for Node {
             custom_openhcl_boot,
             custom_kernel,
             custom_sidecar,
+            custom_binary,
             custom_extra_rootfs,
         } = local_only.unwrap_or(OpenhclIgvmRecipeDetailsLocalOnly {
             openvmm_hcl_no_strip: false,
@@ -657,6 +659,7 @@ impl SimpleFlowNode for Node {
             custom_openhcl_boot: None,
             custom_kernel: None,
             custom_sidecar: None,
+            custom_binary: None,
             custom_extra_rootfs: Vec::new(),
         });
 
@@ -917,6 +920,7 @@ impl SimpleFlowNode for Node {
 
         let sidecar_bin = sidecar.clone().map(|x| x.map(ctx, |y| y.bin));
         let openhcl_boot_bin = openhcl_boot.map(ctx, |x| x.bin);
+        let custom_binary = custom_binary.map(ReadVar::from_static);
         let resources = ctx.emit_minor_rust_stepv("enumerate igvm resources", |ctx| {
             claim_vars!(
                 ctx,
@@ -926,7 +930,8 @@ impl SimpleFlowNode for Node {
                     openhcl_boot_bin,
                     sidecar_bin,
                     uefi_resource,
-                    vtl0_kernel_resource
+                    vtl0_kernel_resource,
+                    custom_binary
                 )
             );
             |rt| {
@@ -942,6 +947,9 @@ impl SimpleFlowNode for Node {
                 }
                 if let Some(vtl0_kernel_resource) = vtl0_kernel_resource {
                     vtl0_kernel_resource.add_to_resources(&mut resources, rt);
+                }
+                if let Some(custom_binary) = custom_binary {
+                    resources.insert(ResourceType::CustomBinary, rt.read(custom_binary));
                 }
                 resources
             }
