@@ -293,6 +293,22 @@ impl RemoteRamGpaRangeHandle {
     }
 }
 
+/// Maximum size in bytes of an incoming guest-driven servicing IGVM image.
+pub const MAX_SERVICING_IGVM_SIZE: usize = 128 * 1024 * 1024;
+
+/// A complete, untrusted IGVM image received for guest-driven servicing.
+///
+/// The consumer must validate the image and call
+/// [`GuestEmulationTransportClient::finish_guest_driven_servicing`](crate::GuestEmulationTransportClient::finish_guest_driven_servicing)
+/// after disposing of it, including when processing fails.
+#[derive(Debug, MeshPayload)]
+pub struct GuestDrivenServicingRequest {
+    /// GUID associated with the transfer.
+    pub correlation_id: Guid,
+    /// Complete IGVM image, bounded by [`MAX_SERVICING_IGVM_SIZE`].
+    pub igvm_data: Vec<u8>,
+}
+
 /// Request to save Guest state during servicing.
 #[derive(MeshPayload)]
 pub struct GuestSaveRequest {

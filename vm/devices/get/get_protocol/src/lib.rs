@@ -96,6 +96,7 @@ open_enum! {
         BATTERY_STATUS = 7,
         INJECT_DEBUG_INTERRUPT = 8,
         NOTIFY_POST_LIVE_MIGRATION = 9,
+        SEND_IGVM_TO_GUEST = 10,
     }
 }
 
@@ -1197,8 +1198,12 @@ pub struct SaveGuestVtl2StateFlags {
     #[bits(1)]
     pub enable_mana_keepalive: bool,
 
+    /// Legacy kexec request bit, retained for wire compatibility and ignored.
+    #[bits(1)]
+    pub enable_kexec: bool,
+
     /// Reserved, must be zero.
-    #[bits(62)]
+    #[bits(61)]
     _rsvd1: u64,
 }
 
@@ -1954,6 +1959,86 @@ impl LoadFirmwareResponse {
             status,
             entry_point_image_offset,
         }
+    }
+}
+
+open_enum! {
+    /// Status of an incoming guest-driven servicing transfer.
+    #[derive(IntoBytes, FromBytes, Immutable, KnownLayout)]
+    pub enum GuestDrivenServicingStatus: u16 {
+        SUCCESS = 0,
+        FAILURE = 1,
+        MORE_DATA = 2,
+    }
+}
+
+/// An IGVM chunk follows this header. Intermediate chunks use `MORE_DATA`;
+/// the final chunk uses `SUCCESS`.
+#[repr(C, packed)]
+#[derive(Copy, Clone, Debug, IntoBytes, FromBytes, Immutable, KnownLayout)]
+pub struct SendIgvmToGuestNotification {
+    pub message_header: HeaderGuestNotification,
+    pub correlation_id: Guid,
+    pub status: GuestDrivenServicingStatus,
+    pub total_igvm_size: u32,
+    pub data_length: u32,
+}
+
+const_assert_eq!(30, size_of::<SendIgvmToGuestNotification>());
+
+impl SendIgvmToGuestNotification {
+    pub fn new(
+        correlation_id: Guid,
+        status: GuestDrivenServicingStatus,
+        total_igvm_size: u32,
+        data_length: u32,
+    ) -> Self {
+        Self {
+            message_header: HeaderGeneric::new(GuestNotifications::SEND_IGVM_TO_GUEST),
+            correlation_id,
+            status,
+            total_igvm_size,
+            data_length,
+        }
+    }
+}
+
+#[cfg(test)]
+mod servicing_tests {
+    use super::*;
+    use test_with_tracing::test;
+
+    #[test]
+    fn servicing_notification_wire_layout() {
+        let correlation_id = guid::guid!("00112233-4455-6677-8899-aabbccddeeff");
+        let notification = SendIgvmToGuestNotification::new(
+            correlation_id,
+            GuestDrivenServicingStatus::MORE_DATA,
+            0x04030201,
+            0x08070605,
+        );
+        let expected = [
+            1, 4, 10, 0, 0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xaa, 0xbb,
+            0xcc, 0xdd, 0xee, 0xff, 2, 0, 1, 2, 3, 4, 5, 6, 7, 8,
+        ];
+        assert_eq!(notification.as_bytes(), &expected);
+        assert_eq!(align_of::<SendIgvmToGuestNotification>(), 1);
+        let decoded = SendIgvmToGuestNotification::read_from_bytes(&expected).unwrap();
+        assert_eq!({ decoded.correlation_id }, correlation_id);
+        assert_eq!({ decoded.total_igvm_size }, 0x04030201);
+        assert_eq!({ decoded.data_length }, 0x08070605);
+        assert_eq!(HostRequests::LOAD_FIRMWARE.0, 30);
+    }
+
+    #[test]
+    fn servicing_status_wire_values() {
+        assert_eq!(GuestDrivenServicingStatus::SUCCESS.as_bytes(), &[0, 0]);
+        assert_eq!(GuestDrivenServicingStatus::FAILURE.as_bytes(), &[1, 0]);
+        assert_eq!(GuestDrivenServicingStatus::MORE_DATA.as_bytes(), &[2, 0]);
+        assert_eq!(
+            GuestDrivenServicingStatus::read_from_bytes(&[0xff, 0xff]).unwrap(),
+            GuestDrivenServicingStatus(0xffff)
+        );
     }
 }
 

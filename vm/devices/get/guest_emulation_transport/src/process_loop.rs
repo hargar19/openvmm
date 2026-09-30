@@ -5,7 +5,9 @@
 //! the Host via the GET
 
 use self::msg::Msg;
+use crate::api::GuestDrivenServicingRequest;
 use crate::api::GuestSaveRequest;
+use crate::api::MAX_SERVICING_IGVM_SIZE;
 use crate::client::ModifyVtl2SettingsRequest;
 use crate::error::IgvmAttestError;
 use crate::error::TryIntoProtocolBool;
@@ -56,8 +58,6 @@ pub(crate) enum FatalError {
     OpenPipe(#[source] vmbus_user_channel::Error),
     #[error("get fd io error")]
     FdIo(#[source] std::io::Error),
-    #[error("message size of {0} too small to read header")]
-    MessageSizeHeader(usize),
     #[error("message size of {len} was not correct to read host response {response:?}")]
     MessageSizeHostResponse { len: usize, response: HostRequests },
     #[error("message size of {len} did not match dpsv2 size {expected}")]
@@ -100,6 +100,386 @@ pub(crate) enum FatalError {
         response_size: usize,
         maximum_size: usize,
     },
+}
+
+#[derive(Debug, Error)]
+enum GuestDrivenServicingError {
+    #[error("a completed servicing image is still pending")]
+    Busy,
+    #[error("servicing notification header is truncated")]
+    ShortHeader,
+    #[error("unsupported servicing notification version")]
+    InvalidVersion,
+    #[error("servicing chunk length does not match its payload")]
+    DataLength,
+    #[error("unknown servicing status {0:?}")]
+    InvalidStatus(get_protocol::GuestDrivenServicingStatus),
+    #[error("host cancelled the servicing transfer")]
+    Cancelled,
+    #[error("invalid servicing image size {0}")]
+    InvalidTotal(u32),
+    #[error("servicing correlation ID or total size changed during transfer")]
+    TransferMismatch,
+    #[error("servicing accumulated length overflowed")]
+    LengthOverflow,
+    #[error("servicing data exceeds the declared image size")]
+    SizeExceeded,
+    #[error("final servicing chunk does not complete the image")]
+    Incomplete,
+    #[error("could not allocate servicing image buffer")]
+    Allocation(#[source] std::collections::TryReserveError),
+}
+
+struct GuestDrivenServicingTransfer {
+    request: GuestDrivenServicingRequest,
+    total: usize,
+}
+
+#[derive(Default)]
+struct GuestDrivenServicing {
+    transfer: Option<GuestDrivenServicingTransfer>,
+    busy: Option<Guid>,
+}
+
+impl GuestDrivenServicing {
+    fn receive(
+        &mut self,
+        buf: &[u8],
+        size_limit: usize,
+    ) -> Result<Option<GuestDrivenServicingRequest>, GuestDrivenServicingError> {
+        use GuestDrivenServicingError as Error;
+        use get_protocol::GuestDrivenServicingStatus as Status;
+
+        if self.busy.is_some() {
+            return Err(Error::Busy);
+        }
+
+        let transfer = self.transfer.take();
+        let (header, data) = get_protocol::SendIgvmToGuestNotification::read_from_prefix(buf)
+            .map_err(|_| Error::ShortHeader)?;
+        if header.message_header.message_version != get_protocol::MessageVersions::HEADER_VERSION_1
+        {
+            return Err(Error::InvalidVersion);
+        }
+        if usize::try_from(header.data_length).ok() != Some(data.len()) {
+            return Err(Error::DataLength);
+        }
+        let final_chunk = match header.status {
+            Status::SUCCESS => true,
+            Status::MORE_DATA => false,
+            Status::FAILURE => return Err(Error::Cancelled),
+            status => return Err(Error::InvalidStatus(status)),
+        };
+        let total = usize::try_from(header.total_igvm_size)
+            .map_err(|_| Error::InvalidTotal(header.total_igvm_size))?;
+        if total == 0 || total > size_limit {
+            return Err(Error::InvalidTotal(header.total_igvm_size));
+        }
+        let mut transfer = match transfer {
+            Some(transfer) => {
+                if transfer.request.correlation_id != { header.correlation_id }
+                    || transfer.total != total
+                {
+                    return Err(Error::TransferMismatch);
+                }
+                transfer
+            }
+            None => GuestDrivenServicingTransfer {
+                request: GuestDrivenServicingRequest {
+                    correlation_id: header.correlation_id,
+                    igvm_data: Vec::new(),
+                },
+                total,
+            },
+        };
+        let accumulated = transfer
+            .request
+            .igvm_data
+            .len()
+            .checked_add(data.len())
+            .ok_or(Error::LengthOverflow)?;
+        if accumulated > total {
+            return Err(Error::SizeExceeded);
+        }
+        if final_chunk && accumulated != total {
+            return Err(Error::Incomplete);
+        }
+        transfer
+            .request
+            .igvm_data
+            .try_reserve_exact(total - transfer.request.igvm_data.len())
+            .map_err(Error::Allocation)?;
+        transfer.request.igvm_data.extend_from_slice(data);
+
+        if final_chunk {
+            self.busy = Some(transfer.request.correlation_id);
+            Ok(Some(transfer.request))
+        } else {
+            self.transfer = Some(transfer);
+            Ok(None)
+        }
+    }
+
+    fn finish(&mut self, correlation_id: Guid) -> bool {
+        if self.busy == Some(correlation_id) {
+            self.busy = None;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod servicing_tests {
+    use super::*;
+    use get_protocol::GuestDrivenServicingStatus as Status;
+    use test_with_tracing::test;
+
+    const FIRST: Guid = guid::guid!("00112233-4455-6677-8899-aabbccddeeff");
+    const SECOND: Guid = guid::guid!("11223344-5566-7788-99aa-bbccddeeff00");
+    const LIMIT: usize = 16;
+
+    fn packet(correlation_id: Guid, status: Status, total: u32, data: &[u8]) -> Vec<u8> {
+        let mut packet = get_protocol::SendIgvmToGuestNotification::new(
+            correlation_id,
+            status,
+            total,
+            data.len() as u32,
+        )
+        .as_bytes()
+        .to_vec();
+        packet.extend_from_slice(data);
+        packet
+    }
+
+    #[test]
+    fn servicing_single_chunk_busy_and_finish() {
+        let mut servicing = GuestDrivenServicing::default();
+        let completed_packet = packet(FIRST, Status::SUCCESS, 3, b"abc");
+        let request = servicing
+            .receive(&completed_packet, LIMIT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.correlation_id, FIRST);
+        assert_eq!(request.igvm_data, b"abc");
+        assert!(servicing.transfer.is_none());
+        for rejected in [
+            completed_packet.clone(),
+            Vec::new(),
+            packet(SECOND, Status::FAILURE, 0, b""),
+        ] {
+            assert!(matches!(
+                servicing.receive(&rejected, LIMIT),
+                Err(GuestDrivenServicingError::Busy)
+            ));
+        }
+        assert!(!servicing.finish(SECOND));
+        assert_eq!(servicing.busy, Some(FIRST));
+        drop(request);
+        assert!(servicing.finish(FIRST));
+        assert!(!servicing.finish(FIRST));
+        assert!(
+            servicing
+                .receive(&completed_packet, LIMIT)
+                .unwrap()
+                .is_some()
+        );
+    }
+
+    #[test]
+    fn servicing_multi_chunk_and_stale_finish() {
+        let mut servicing = GuestDrivenServicing::default();
+        assert!(
+            servicing
+                .receive(&packet(FIRST, Status::MORE_DATA, 3, b"a"), LIMIT)
+                .unwrap()
+                .is_none()
+        );
+        assert!(!servicing.finish(FIRST));
+        assert!(
+            servicing
+                .receive(&packet(FIRST, Status::MORE_DATA, 3, b"b"), LIMIT)
+                .unwrap()
+                .is_none()
+        );
+        let request = servicing
+            .receive(&packet(FIRST, Status::SUCCESS, 3, b"c"), LIMIT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.igvm_data, b"abc");
+        drop(request);
+        assert!(servicing.finish(FIRST));
+        assert!(
+            servicing
+                .receive(&packet(SECOND, Status::SUCCESS, 1, b"d"), LIMIT)
+                .unwrap()
+                .is_some()
+        );
+        assert!(!servicing.finish(FIRST));
+        assert_eq!(servicing.busy, Some(SECOND));
+    }
+
+    #[test]
+    fn servicing_invalid_transfers_reset_and_retry() {
+        let mut short_payload = packet(FIRST, Status::MORE_DATA, 3, b"bc");
+        short_payload.pop();
+        let mut extra_payload = packet(FIRST, Status::MORE_DATA, 3, b"b");
+        extra_payload.push(b'c');
+        let mut bad_version = packet(FIRST, Status::SUCCESS, 3, b"bc");
+        bad_version[0] = 0;
+        let invalid = [
+            packet(FIRST, Status::FAILURE, 0, b""),
+            packet(FIRST, Status(3), 3, b"bc"),
+            packet(FIRST, Status::MORE_DATA, 0, b""),
+            packet(FIRST, Status::MORE_DATA, LIMIT as u32 + 1, b""),
+            packet(FIRST, Status::MORE_DATA, u32::MAX, b""),
+            packet(SECOND, Status::SUCCESS, 3, b"bc"),
+            packet(FIRST, Status::SUCCESS, 4, b"bcd"),
+            packet(FIRST, Status::SUCCESS, 3, b"b"),
+            packet(FIRST, Status::SUCCESS, 3, b"bcd"),
+            packet(FIRST, Status::MORE_DATA, 3, b"bcd"),
+            short_payload,
+            extra_payload,
+            bad_version,
+        ];
+        for invalid in invalid {
+            let mut servicing = GuestDrivenServicing::default();
+            servicing
+                .receive(&packet(FIRST, Status::MORE_DATA, 3, b"a"), LIMIT)
+                .unwrap();
+            assert!(servicing.receive(&invalid, LIMIT).is_err());
+            assert!(servicing.transfer.is_none());
+            assert!(servicing.busy.is_none());
+            let request = servicing
+                .receive(&packet(SECOND, Status::SUCCESS, 3, b"xyz"), LIMIT)
+                .unwrap()
+                .unwrap();
+            assert_eq!(request.correlation_id, SECOND);
+            assert_eq!(request.igvm_data, b"xyz");
+        }
+    }
+
+    #[test]
+    fn servicing_short_headers_reset_and_retry() {
+        let full = packet(FIRST, Status::SUCCESS, 1, b"a");
+        for length in 0..size_of::<get_protocol::SendIgvmToGuestNotification>() {
+            let mut servicing = GuestDrivenServicing::default();
+            servicing
+                .receive(&packet(FIRST, Status::MORE_DATA, 3, b"a"), LIMIT)
+                .unwrap();
+            assert!(matches!(
+                servicing.receive(&full[..length], LIMIT),
+                Err(GuestDrivenServicingError::ShortHeader)
+            ));
+            assert!(servicing.transfer.is_none());
+            assert!(servicing.receive(&full, LIMIT).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn servicing_size_limit() {
+        let mut servicing = GuestDrivenServicing::default();
+        for total in [0, LIMIT as u32 + 1, u32::MAX] {
+            assert!(matches!(
+                servicing.receive(&packet(FIRST, Status::MORE_DATA, total, b""), LIMIT),
+                Err(GuestDrivenServicingError::InvalidTotal(_))
+            ));
+            assert!(servicing.transfer.is_none());
+        }
+        let data = [0x42; LIMIT];
+        let request = servicing
+            .receive(&packet(FIRST, Status::SUCCESS, LIMIT as u32, &data), LIMIT)
+            .unwrap()
+            .unwrap();
+        assert_eq!(request.igvm_data, data);
+    }
+
+    async fn notification_barrier<T: RingMem>(
+        host: &mut MessagePipe<T>,
+        gen_id: &mut mesh::Receiver<[u8; 16]>,
+    ) {
+        host.send(get_protocol::UpdateGenerationId::new([7; 16]).as_bytes())
+            .await
+            .unwrap();
+        assert_eq!(gen_id.recv().await.unwrap(), [7; 16]);
+    }
+
+    #[pal_async::async_test]
+    async fn servicing_client_delivery_and_runtime_survival(driver: pal_async::DefaultDriver) {
+        use pal_async::task::Spawn;
+
+        let (mut host, guest) =
+            vmbus_async::pipe::connected_message_pipes(get_protocol::MAX_MESSAGE_SIZE);
+        let (send, recv) = mesh::channel();
+        let client = crate::GuestEmulationTransportClient::new(
+            send,
+            get_protocol::ProtocolVersion::NICKEL_REV2,
+        );
+        let task = driver.spawn("servicing get", async move {
+            ProcessLoop::new(guest).run(recv).await
+        });
+        let mut gen_id = client.take_generation_id_recv().await.unwrap();
+        let full = packet(FIRST, Status::SUCCESS, 3, b"abc");
+        for length in 0..size_of::<get_protocol::SendIgvmToGuestNotification>() {
+            host.send(&full[..length]).await.unwrap();
+        }
+        host.send(&packet(FIRST, Status(99), 3, b"abc"))
+            .await
+            .unwrap();
+        let mut bad_version = full.clone();
+        bad_version[0] = 0;
+        host.send(&bad_version).await.unwrap();
+        host.send(&packet(FIRST, Status::MORE_DATA, 3, b"a"))
+            .await
+            .unwrap();
+        notification_barrier(&mut host, &mut gen_id).await;
+        host.send(&packet(FIRST, Status::SUCCESS, 3, b"bc"))
+            .await
+            .unwrap();
+        host.send(&packet(SECOND, Status::SUCCESS, 3, b"xyz"))
+            .await
+            .unwrap();
+        notification_barrier(&mut host, &mut gen_id).await;
+        assert!(!client.finish_guest_driven_servicing(SECOND).await);
+
+        let mut requests = client.take_guest_driven_servicing_recv().await.unwrap();
+        assert!(client.take_guest_driven_servicing_recv().await.is_none());
+        let request = requests.recv().await.unwrap();
+        assert_eq!(request.correlation_id, FIRST);
+        assert_eq!(request.igvm_data, b"abc");
+        assert!(requests.try_recv().is_err());
+
+        host.send(&packet(FIRST, Status::FAILURE, 0, b""))
+            .await
+            .unwrap();
+        host.send(&full[..3]).await.unwrap();
+        host.send(&packet(SECOND, Status::SUCCESS, 3, b"xyz"))
+            .await
+            .unwrap();
+        notification_barrier(&mut host, &mut gen_id).await;
+        assert!(requests.try_recv().is_err());
+        drop(request);
+        assert!(client.finish_guest_driven_servicing(FIRST).await);
+
+        host.send(&packet(SECOND, Status::SUCCESS, 3, b"xyz"))
+            .await
+            .unwrap();
+        host.send(&full).await.unwrap();
+        notification_barrier(&mut host, &mut gen_id).await;
+        assert!(!client.finish_guest_driven_servicing(FIRST).await);
+        let request = requests.recv().await.unwrap();
+        assert_eq!(request.correlation_id, SECOND);
+        assert_eq!(request.igvm_data, b"xyz");
+        assert!(requests.try_recv().is_err());
+        drop(request);
+        assert!(client.finish_guest_driven_servicing(SECOND).await);
+
+        let mut response = [0; get_protocol::MAX_MESSAGE_SIZE];
+        assert!(host.recv(&mut response).now_or_never().is_none());
+        drop(client);
+        task.await.unwrap();
+    }
 }
 
 type HostRequestQueue = VecDeque<Pin<Box<dyn Future<Output = Result<(), FatalError>> + Send>>>;
@@ -156,6 +536,7 @@ fn is_secondary_host_request(request: HostRequests) -> bool {
 }
 
 pub(crate) mod msg {
+    use crate::api::GuestDrivenServicingRequest;
     use crate::api::GuestSaveRequest;
     use crate::client::ModifyVtl2SettingsRequest;
     use chipset_resources::battery::HostBatteryUpdate;
@@ -242,6 +623,12 @@ pub(crate) mod msg {
         ///
         /// CVM NOTE: Servicing is not yet supported, any requests will be rejected.
         TakeSaveRequestReceiver(Rpc<(), Option<mesh::Receiver<GuestSaveRequest>>>),
+        /// Take the late-bound receiver for complete, untrusted servicing images.
+        TakeGuestDrivenServicingReceiver(
+            Rpc<(), Option<mesh::Receiver<GuestDrivenServicingRequest>>>,
+        ),
+        /// Locally release a completed image if its correlation ID matches.
+        FinishGuestDrivenServicing(Rpc<Guid, bool>),
         /// Take the late-bound receiver for updating dynamic Vtl2 settings.
         /// This is used to inform Underhill of changes to attached storage and
         /// networking devices and their settings.
@@ -528,6 +915,8 @@ pub(crate) struct ProcessLoop<T: RingMem> {
     #[inspect(skip)]
     vtl2_settings_buf: Option<Vec<u8>>,
     #[inspect(skip)]
+    guest_driven_servicing: GuestDrivenServicing,
+    #[inspect(skip)]
     primary_host_requests: HostRequestQueue,
     #[inspect(skip)]
     pipe_channels: PipeChannels,
@@ -558,6 +947,7 @@ pub(crate) struct ProcessLoop<T: RingMem> {
 struct GuestNotificationListeners {
     generation_id: GuestNotificationSender<[u8; 16]>,
     save_request: GuestNotificationSender<GuestSaveRequest>,
+    guest_driven_servicing: BufferedSender<1, GuestDrivenServicingRequest>,
     vtl2_settings: GuestNotificationSender<ModifyVtl2SettingsRequest>,
     #[inspect(skip)]
     vpci: HashMap<Guid, mesh::Sender<VpciBusEvent>>,
@@ -731,6 +1121,7 @@ impl<T: RingMem> ProcessLoop<T> {
             stats: Default::default(),
             guest_notification_responses: Default::default(),
             vtl2_settings_buf: None,
+            guest_driven_servicing: GuestDrivenServicing::default(),
             primary_host_requests: Default::default(),
             secondary_host_requests: Default::default(),
             pipe_channels: PipeChannels {
@@ -747,6 +1138,7 @@ impl<T: RingMem> ProcessLoop<T> {
                 generation_id: GuestNotificationSender::new(),
                 vtl2_settings: GuestNotificationSender::new(),
                 save_request: GuestNotificationSender::new(),
+                guest_driven_servicing: BufferedSender::new(),
                 vpci: HashMap::new(),
                 battery_status: GuestNotificationSender::new(),
             },
@@ -969,9 +1361,10 @@ impl<T: RingMem> ProcessLoop<T> {
                 Event::Header(len) => {
                     let len = len?;
                     let buf = &buf[..len];
-                    let header = get_protocol::HeaderRaw::read_from_prefix(buf)
-                        .map_err(|_| FatalError::MessageSizeHeader(len))?
-                        .0; // TODO: zerocopy: map_err (https://github.com/microsoft/openvmm/issues/759)
+                    let Ok((header, _)) = get_protocol::HeaderRaw::read_from_prefix(buf) else {
+                        tracelimit::warn_ratelimited!(len, "dropping truncated GET message header");
+                        continue;
+                    };
 
                     match header.message_type {
                         get_protocol::MessageTypes::HOST_RESPONSE => {
@@ -1124,6 +1517,17 @@ impl<T: RingMem> ProcessLoop<T> {
                         get_protocol::GuestNotifications::BATTERY_STATUS,
                     ))
             }),
+            Msg::TakeGuestDrivenServicingReceiver(req) => req.handle_sync(|()| {
+                self.guest_notification_listeners
+                    .guest_driven_servicing
+                    .init_receiver()
+                    .map(|(recv, _)| recv)
+            }),
+            Msg::FinishGuestDrivenServicing(req) => {
+                req.handle_sync(|correlation_id| {
+                    self.guest_driven_servicing.finish(correlation_id)
+                });
+            }
             Msg::VpciListenerRegistration(req) => {
                 req.handle_sync(|input| {
                     self.guest_notification_listeners
@@ -1320,6 +1724,11 @@ impl<T: RingMem> ProcessLoop<T> {
     ) -> Result<(), FatalError> {
         use get_protocol::GuestNotifications;
 
+        if header.message_id() == GuestNotifications::SEND_IGVM_TO_GUEST {
+            self.handle_guest_driven_servicing_notification(buf);
+            return Ok(());
+        }
+
         // Version must be at least version 1.
         if header.message_version < get_protocol::MessageVersions::HEADER_VERSION_1 {
             tracing::error!(
@@ -1378,6 +1787,33 @@ impl<T: RingMem> ProcessLoop<T> {
         }
 
         Ok(())
+    }
+
+    fn handle_guest_driven_servicing_notification(&mut self, buf: &[u8]) {
+        match self
+            .guest_driven_servicing
+            .receive(buf, MAX_SERVICING_IGVM_SIZE)
+        {
+            Ok(Some(request)) => {
+                let correlation_id = request.correlation_id;
+                if self
+                    .guest_notification_listeners
+                    .guest_driven_servicing
+                    .send(request)
+                    .is_err()
+                {
+                    self.guest_driven_servicing.finish(correlation_id);
+                    tracelimit::warn_ratelimited!("guest-driven servicing receiver is full");
+                }
+            }
+            Ok(None) => {}
+            Err(error) => {
+                tracelimit::warn_ratelimited!(
+                    error = &error as &dyn std::error::Error,
+                    "dropping guest-driven servicing notification"
+                );
+            }
+        }
     }
 
     /// Reads the host response and validates response matches the expected

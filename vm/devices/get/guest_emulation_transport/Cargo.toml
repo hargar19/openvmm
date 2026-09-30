@@ -29,6 +29,7 @@ inspect.workspace = true
 inspect_counters.workspace = true
 mesh.workspace = true
 pal_async.workspace = true
+tracelimit.workspace = true
 tracing_helpers.workspace = true
 
 anyhow.workspace = true
