@@ -1,5 +1,7 @@
 # Building OpenHCL
 
+This page explains how to build and customize OpenHCL IGVM firmware images.
+
 **Prerequisites:**
 
 - [Getting started on Linux / WSL2](./linux.md).
@@ -164,6 +166,94 @@ Some examples of potentially useful customization include:
     variants.
 
 For a full list of available customizations, refer to `build-igvm --help`.
+
+### Experimental IGVM kexec payloads
+
+You can build an IGVM carrying a custom kernel and its matching initrd for
+in-place OpenHCL servicing. See the
+[IGVM servicing contract](../../reference/architecture/openhcl/igvm.md#experimental-kexec-servicing)
+for the payload layout and delivery protocol.
+
+```admonish warning
+This experimental path supports only x64, non-isolated VMs and requires a
+compatible custom Hyper-V delivery implementation installed on the host.
+Both the bootstrap image and every successor image must be built from the
+same compatible implementation of the payload descriptor and userspace
+restore contract. Unmodified Mayank images are not supported.
+
+This repository does not provide the compatible host delivery source or a
+host trigger CLI. Use the procedure supplied with your compatible host
+implementation; building an IGVM alone does not initiate servicing.
+```
+
+Use a raw, uncompressed x64 ELF `vmlinux` and the modules tree from that same
+kernel build. Pass the **same file** as both `--custom-kernel` and
+`--custom-binary`; a compressed kernel or `bzImage` is not a substitute:
+
+```bash
+cargo xflowey build-igvm x64 \
+     --custom-kernel path/to/vmlinux \
+     --custom-kernel-modules path/to/modules \
+     --custom-binary path/to/vmlinux
+```
+
+The modules directory must contain the installed `kernel/drivers/...` tree,
+not just the kernel build directory's `drivers/...` files. The custom kernel
+resolver also expects `kernel_build_metadata.json` beside `vmlinux`.
+
+Add `--with-sidecar` to include the sidecar. Without `--release`, the output
+for this customized recipe is
+`flowey-out/artifacts/build-igvm/debug/x64-custom/openhcl-x64-custom.bin`.
+Use `--build-label x64-kexec-a` to select a different output label and
+preserve each build's output before building the next image.
+
+The custom binary is included as normal measured IGVM `PageData`, alongside
+the existing initrd. Servicing extracts the kernel and initrd from the
+incoming image; it neither reads a kernel from the running root filesystem
+nor rebuilds a CPIO archive.
+
+#### Validate the artifacts and transition
+
+Before host testing, run the focused parser and kexec tests:
+
+```bash
+cargo nextest run --profile agent -p underhill_core -E 'test(kexec)'
+```
+
+To run the production extractor against your generated artifact without
+invoking kexec, run the opt-in artifact test:
+
+```bash
+OPENHCL_TEST_SERVICING_IGVM=path/to/openhcl.bin \
+OPENHCL_TEST_VMLINUX=path/to/vmlinux \
+OPENHCL_TEST_INITRD=path/to/openhcl.cpio.gz \
+cargo nextest run --profile agent -p underhill_core --run-ignored only \
+    -E 'test(servicing_igvm_artifact_matches_inputs)'
+```
+
+This test checks exact extracted bytes, but does not validate the host
+delivery path or execute the transition. For end-to-end validation:
+
+1. Inspect each built IGVM's `KexecPayloadDescriptor` and extract its kernel
+    and initrd ranges using their exact byte lengths, excluding page padding.
+    Compare the extracted kernel byte-for-byte with the input `vmlinux`, and
+    the extracted initrd with the initrd supplied to that image's IGVM build.
+    Inspect the initrd's file listing and confirm that it contains no
+    `boot/vmlinux` (the guest path `/boot/vmlinux`). Keep these checks with
+    the corresponding image so that later builds cannot overwrite the inputs.
+2. Establish a same-build baseline: boot image A, then deliver that same
+    image through the compatible host implementation. Confirm ordinary
+    OpenHCL start completion and that VTL0 resumes and remains responsive,
+    without a guest reboot.
+3. Build image B with distinguishable kernel and OpenHCL userspace build
+    identities, retaining the matching restore contract. Boot A and deliver
+    B. Verify the running VTL2 kernel release and userspace build identity
+    match B, rather than relying only on a successful notification or the
+    image's filename. Verify VTL0 remains alive and its workload continues.
+4. Repeat servicing cycles, checking completion and VTL0 liveness each time.
+    Exercise sidecar-enabled images and active VTL0 network and storage I/O;
+    check that connections and storage operations recover and continue
+    without data corruption.
 
 ### Advanced
 
