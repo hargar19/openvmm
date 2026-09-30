@@ -127,6 +127,9 @@ open_enum! {
         /// This memory is used by VTL2 to store the persisted protobuf payload.
         /// This memory is marked as reserved to the kernel.
         VTL2_PERSISTED_STATE_PROTOBUF = 12,
+        /// This memory is used by VTL2 to store persisted servicing state
+        /// across kexec. This memory is marked as reserved to the kernel.
+        VTL2_PERSISTED_SERVICING_STATE = 13,
     }
 }
 
@@ -146,6 +149,7 @@ impl MemoryVtlType {
                 | MemoryVtlType::VTL2_BOOTSHIM_LOG_BUFFER
                 | MemoryVtlType::VTL2_PERSISTED_STATE_HEADER
                 | MemoryVtlType::VTL2_PERSISTED_STATE_PROTOBUF
+                | MemoryVtlType::VTL2_PERSISTED_SERVICING_STATE
         )
     }
 
@@ -164,6 +168,7 @@ impl MemoryVtlType {
                 | MemoryVtlType::VTL2_BOOTSHIM_LOG_BUFFER
                 | MemoryVtlType::VTL2_PERSISTED_STATE_HEADER
                 | MemoryVtlType::VTL2_PERSISTED_STATE_PROTOBUF
+                | MemoryVtlType::VTL2_PERSISTED_SERVICING_STATE
         )
     }
 }
@@ -258,6 +263,14 @@ pub struct PersistedStateHeader {
     /// The size of the protobuf payload in bytes.
     /// This must be less than or equal to `protobuf_region_len`.
     pub protobuf_payload_len: u64,
+    /// The gpa for the start of the servicing state region. This must be 4K
+    /// aligned. Zero means no servicing state is stored.
+    pub servicing_state_base: u64,
+    /// The size of the servicing state region in bytes.
+    pub servicing_state_region_len: u64,
+    /// The size of the servicing state payload in bytes.
+    /// This must be less than or equal to `servicing_state_region_len`.
+    pub servicing_state_payload_len: u64,
 }
 
 impl PersistedStateHeader {

@@ -383,9 +383,11 @@ impl Worker for UnderhillVmWorker {
     fn new(params: Self::Parameters) -> anyhow::Result<Self> {
         pal_async::local::block_with_io(async |driver| {
             let (get_infra, get_watchdog_task) = construct_get().await?;
+
             let get_client = get_infra.get_client.clone();
 
-            let result = Self::new_or_restart(get_infra, params, true, None, driver).await;
+            let boot_init = !servicing::is_kexec_servicing_boot();
+            let result = Self::new_or_restart(get_infra, params, boot_init, None, driver).await;
 
             if let Err(err) = &result {
                 tracing::error!(
@@ -511,39 +513,52 @@ impl UnderhillVmWorker {
                 .context("failed to create thread pool")?
         };
 
-        // In a servicing scenario where the saved state is held on the VM host,
-        // we only know that saved state exists after we get the DPS information.
-        let saved_state_from_host = dps.general.is_servicing_scenario;
+        // In a host-driven servicing scenario, saved state comes from the host.
+        // After kexec, it comes from the persisted VTL2 memory region.
+        let servicing_state_from_host = dps.general.is_servicing_scenario;
+        let kexec_servicing = servicing::is_kexec_servicing_boot();
+        let mut restored_state_from_host = false;
 
-        if saved_state_from_host {
-            assert!(
-                servicing_state.is_none(),
-                "cannot have saved state from two different sources"
-            );
-
+        if servicing_state_from_host || kexec_servicing {
             if let Some(TestScenarioConfig::RestoreStuck) = params.env_cfg.test_configuration {
                 tracing::info!(
                     "Test configuration SERVICING_RESTORE_STUCK is set. Waiting indefinitely in restore."
                 );
                 future::pending::<()>().await;
             }
+        }
 
+        if kexec_servicing {
+            let parsed = bootloader_fdt_parser::ParsedBootDtInfo::new()
+                .context("failed to parse device tree for persisted servicing state")?;
+            let saved_state_buf = crate::loader::vtl2_config::read_servicing_state_from_persisted(
+                &parsed,
+            )?
+            .context("OPENHCL_KEXEC_SERVICING set but no persisted servicing state found")?;
+            servicing_state = Some(
+                mesh::payload::decode(&saved_state_buf)
+                    .context("failed to decode persisted servicing state")?,
+            );
+            tracing::debug!(
+                CVM_ALLOWED,
+                saved_state_len = saved_state_buf.len(),
+                "restored servicing state from persisted memory"
+            );
+        } else if servicing_state_from_host {
             tracing::info!(
                 CVM_ALLOWED,
                 "VTL2 restart, getting servicing state from the host"
             );
-
             let saved_state_buf = get_client
                 .get_saved_state_from_host()
                 .instrument(tracing::info_span!("init/get_saved_state", CVM_ALLOWED))
                 .await
                 .context("Failed to get saved state from host")?;
-
             servicing_state = Some(
                 mesh::payload::decode(&saved_state_buf)
                     .context("failed to decode servicing state")?,
             );
-
+            restored_state_from_host = true;
             tracing::info!(
                 CVM_ALLOWED,
                 saved_state_len = saved_state_buf.len(),
@@ -555,6 +570,13 @@ impl UnderhillVmWorker {
             state
                 .fix_post_restore()
                 .context("failed to fix up servicing state on restore")?;
+        }
+
+        if kexec_servicing {
+            let parsed = bootloader_fdt_parser::ParsedBootDtInfo::new()
+                .context("failed to parse device tree to clear persisted servicing state")?;
+            crate::loader::vtl2_config::clear_servicing_state_from_persisted(&parsed)
+                .context("failed to clear persisted servicing state")?;
         }
 
         let is_post_servicing = servicing_state.is_some();
@@ -604,7 +626,7 @@ impl UnderhillVmWorker {
             // that servicing was successful.
             //
             // TODO: send error string to host.
-            if saved_state_from_host {
+            if restored_state_from_host {
                 get_client.report_restore_result_to_host(r.is_ok()).await;
             }
 
