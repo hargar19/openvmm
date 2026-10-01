@@ -18,8 +18,10 @@ fn kexec_servicing_marker(value: Option<&std::ffi::OsStr>) -> bool {
 }
 
 #[cfg(test)]
-mod kexec_boot_tests {
+mod tests {
+    use super::ServicingTimings;
     use super::kexec_servicing_marker;
+    use mesh::payload::Protobuf;
     use std::ffi::OsStr;
     use test_with_tracing::test;
 
@@ -29,6 +31,33 @@ mod kexec_boot_tests {
         for value in [None, Some(""), Some("0"), Some("true"), Some("1 ")] {
             assert!(!kexec_servicing_marker(value.map(OsStr::new)));
         }
+    }
+
+    #[derive(Protobuf)]
+    struct TimingEnvelope {
+        #[mesh(3)]
+        timings: Option<ServicingTimings>,
+    }
+
+    #[test]
+    fn servicing_timings_survive_serialization() {
+        let saved = TimingEnvelope {
+            timings: Some(ServicingTimings {
+                stop_complete: 100,
+                save_complete: 200,
+                shutdown_complete: 300,
+                flush_complete: 400,
+            }),
+        };
+        let encoded = mesh::payload::encode(saved);
+        let restored: TimingEnvelope = mesh::payload::decode(&encoded).unwrap();
+        assert_eq!(mesh::payload::encode(restored), encoded);
+    }
+
+    #[test]
+    fn servicing_timings_are_optional_on_the_wire() {
+        let restored: TimingEnvelope = mesh::payload::decode(&[]).unwrap();
+        assert_eq!(restored.timings, None);
     }
 }
 
@@ -49,6 +78,23 @@ mod state {
         /// Saved state from the state units.
         #[mesh(2)]
         pub units: Vec<SavedStateUnit>,
+        /// Optional diagnostic checkpoints from the outgoing instance.
+        #[mesh(3)]
+        pub timings: Option<ServicingTimings>,
+    }
+
+    /// Phase boundaries in hypervisor reference time (100ns), not Linux uptime.
+    #[derive(Debug, PartialEq, Eq, Protobuf)]
+    #[mesh(package = "underhill")]
+    pub struct ServicingTimings {
+        #[mesh(1)]
+        pub stop_complete: u64,
+        #[mesh(2)]
+        pub save_complete: u64,
+        #[mesh(3)]
+        pub shutdown_complete: u64,
+        #[mesh(4)]
+        pub flush_complete: u64,
     }
 
     /// Servicing state needed to optimize emuplat glue on restore.

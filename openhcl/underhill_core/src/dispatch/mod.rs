@@ -167,6 +167,7 @@ pub(crate) struct LoadedVm {
     pub partition: Arc<UhPartition>,
     pub state_units: StateUnits,
     pub last_state_unit_stop: Option<ReferenceTime>,
+    pub servicing_timeline: Option<crate::reference_time::ServicingTimeline>,
     pub vmbus_server: Option<VmbusServerHandle>,
     // contain task handles which must be kept live
     pub host_vmbus_relay: Option<VmbusRelayHandle>,
@@ -858,6 +859,7 @@ impl LoadedVm {
                 // this for now.
                 anyhow::bail!("cannot service underhill while paused");
             }
+            let stop_complete = self.partition.reference_time();
 
             let mut state = self
                 .save(
@@ -866,6 +868,7 @@ impl LoadedVm {
                     self.mana_keep_alive.clone(),
                 )
                 .await?;
+            let save_complete = self.partition.reference_time();
             state.init_state.correlation_id = Some(correlation_id);
 
             if let Some(TestScenarioConfig::SaveFail) = self.test_configuration {
@@ -925,6 +928,12 @@ impl LoadedVm {
             *devices_shutdown = true;
             let (r, (), ()) = (shutdown_pci, shutdown_mana, shutdown_nvme).join().await;
             r?;
+            state.timings = Some(servicing::ServicingTimings {
+                stop_complete,
+                save_complete,
+                shutdown_complete: self.partition.reference_time(),
+                flush_complete: 0,
+            });
 
             Ok(state)
         }
@@ -969,6 +978,9 @@ impl LoadedVm {
                 error,
             }
         });
+        if let Some(timings) = &mut state.timings {
+            timings.flush_complete = self.partition.reference_time();
+        }
 
         Ok(state)
     }
@@ -998,6 +1010,9 @@ impl LoadedVm {
     }
 
     async fn start(&mut self, correlation_id: Option<Guid>) {
+        if let Some(timeline) = &mut self.servicing_timeline {
+            timeline.record("resume_wait", self.partition.reference_time());
+        }
         self.state_units.start().await;
 
         // Log the boot/blackout time.
@@ -1012,6 +1027,16 @@ impl LoadedVm {
                     .as_str(),
                 "resuming VM"
             );
+            if let Some(mut timeline) = self.servicing_timeline.take() {
+                timeline.record("start", reference_time.as_100ns());
+                tracing::info!(CVM_ALLOWED,
+                    correlation_id = %correlation_id.unwrap_or(Guid::ZERO),
+                    method = timeline.method,
+                    total = ?blackout_time,
+                    phases = ?timeline.durations(),
+                    "servicing blackout phases"
+                );
+            }
         } else {
             // Assume we started at reference time 0.
             let boot_time = reference_time.since(ReferenceTime::new(0));
@@ -1156,6 +1181,7 @@ impl LoadedVm {
                 mana_state,
             },
             units,
+            timings: None,
         };
 
         state

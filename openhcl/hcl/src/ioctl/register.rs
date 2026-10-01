@@ -577,6 +577,14 @@ impl Hcl {
 }
 
 impl MshvHvcall {
+    /// Gets the hypervisor reference time in 100ns units before creating an Hcl.
+    /// `HvCallGetVpRegisters` must be allowed on this handle.
+    pub fn reference_time(&self) -> Result<u64, HvError> {
+        Ok(self
+            .get_vp_register_hypercall(Vtl::Vtl2, HvArchRegisterName::TimeRefCount)?
+            .as_u64())
+    }
+
     /// Get the given register on the current VP for the given VTL via hypercall.
     ///
     /// Only VTL-private registers can go through this path. VTL-shared registers

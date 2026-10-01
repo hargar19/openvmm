@@ -477,6 +477,12 @@ impl UnderhillVmWorker {
         mut servicing_state: Option<ServicingState>,
         early_init_driver: LocalDriver,
     ) -> anyhow::Result<Self> {
+        let timing_clock = hcl::ioctl::MshvHvcall::new().ok();
+        if let Some(clock) = &timing_clock {
+            clock.set_allowed_hypercalls(&[hvdef::HypercallCode::HvCallGetVpRegisters]);
+        }
+        let reference_time = || timing_clock.as_ref()?.reference_time().ok();
+        let worker_entry = reference_time();
         let GuestEmulationTransportInfra {
             get_thread,
             get_spawner,
@@ -528,6 +534,7 @@ impl UnderhillVmWorker {
             }
         }
 
+        let settings_complete = reference_time();
         if kexec_servicing {
             let parsed = bootloader_fdt_parser::ParsedBootDtInfo::new()
                 .context("failed to parse device tree for persisted servicing state")?;
@@ -565,6 +572,7 @@ impl UnderhillVmWorker {
                 "received servicing state from host"
             );
         }
+        let state_read_complete = reference_time();
 
         if let Some(state) = &mut servicing_state {
             state
@@ -581,9 +589,30 @@ impl UnderhillVmWorker {
 
         let is_post_servicing = servicing_state.is_some();
         let correlation_id = (servicing_state.as_ref()).and_then(|s| s.init_state.correlation_id);
+        let mut servicing_timeline = servicing_state.as_mut().and_then(|state| {
+            let timings = state.timings.take()?;
+            let mut timeline = crate::reference_time::ServicingTimeline::default();
+            timeline.record("stop_begin", state.init_state.vm_stop_reference_time);
+            timeline.record("stop", timings.stop_complete);
+            timeline.record("save", timings.save_complete);
+            timeline.record("shutdown", timings.shutdown_complete);
+            timeline.record("flush", timings.flush_complete);
+            let boot_times = if kexec_servicing {
+                None
+            } else {
+                bootloader_fdt_parser::BootTimes::new().ok()
+            };
+            timeline.record_boot(kexec_servicing, boot_times, worker_entry);
+            timeline.record_optional("settings", settings_complete);
+            timeline.record_optional("state_read", state_read_complete);
+            timeline.record_optional("state_fixup", reference_time());
+            Some(timeline)
+        });
         let (servicing_init_state, servicing_unit_state) = match servicing_state {
             None => (None, None),
-            Some(ServicingState { init_state, units }) => (Some(init_state), Some(units)),
+            Some(ServicingState {
+                init_state, units, ..
+            }) => (Some(init_state), Some(units)),
         };
 
         // Build the VM.
@@ -608,6 +637,10 @@ impl UnderhillVmWorker {
             correlation_id = correlation_id.map(tracing::field::display)
         ))
         .await?;
+        if let Some(timeline) = &mut servicing_timeline {
+            timeline.record("vm_build", vm.partition.reference_time());
+        }
+        vm.servicing_timeline = servicing_timeline;
 
         LOADED_VM.store(&vm);
 
@@ -621,6 +654,9 @@ impl UnderhillVmWorker {
                     correlation_id = correlation_id.map(tracing::field::display)
                 ))
                 .await;
+            if let Some(timeline) = &mut vm.servicing_timeline {
+                timeline.record("restore", vm.partition.reference_time());
+            }
 
             // If we received saved state from the host then notify the host
             // that servicing was successful.
@@ -628,6 +664,9 @@ impl UnderhillVmWorker {
             // TODO: send error string to host.
             if restored_state_from_host {
                 get_client.report_restore_result_to_host(r.is_ok()).await;
+            }
+            if let Some(timeline) = &mut vm.servicing_timeline {
+                timeline.record("restore_notify", vm.partition.reference_time());
             }
 
             r.context("failed to restore")?;
@@ -3911,6 +3950,7 @@ async fn new_underhill_vm(
         _halt_task: halt_task,
         state_units,
         last_state_unit_stop: (servicing_state.vm_stop_reference_time).map(ReferenceTime::new),
+        servicing_timeline: None,
         partition,
         uevent_listener,
         resolver,

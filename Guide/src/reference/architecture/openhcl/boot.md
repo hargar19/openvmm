@@ -114,6 +114,73 @@ The `underhill_vm` process runs the VTL0 guest, handling exits and coordinating 
 
 Meanwhile, `openvmm_hcl` manages the overall policy and communicates with the host.
 
+## Comparing Servicing and Kexec Blackout
+
+Build both the outgoing and incoming OpenHCL images with the timing
+instrumentation. After resume, `underhill_core` emits one
+`servicing blackout phases` event with `method="host"` or `method="kexec"`,
+the servicing correlation ID, `total`, and a list of named durations in
+`phases`. No per-checkpoint events are emitted. Outgoing checkpoints are
+carried in an optional saved-state field, so they survive the log flush
+and restart. An older outgoing image without that field produces no phase
+summary.
+
+All checkpoints use hypervisor reference time in 100ns units, including
+the existing bootloader timestamps. The adjacent intervals below partition
+the existing `blackout_time`; their sum equals `total` without adding the
+separately logged state-unit durations. Summary formatting and output happen
+after the blackout endpoint has been captured.
+
+| Phase | Interval |
+|---|---|
+| `stop` | Blackout start through completion of VM stop, including its logging. |
+| `save` | Full save, including emulation platform, state units, drivers, VMBus client, and compatibility fixups. |
+| `shutdown` | Persist boot information and finish concurrent PCI, MANA, and NVMe shutdown. |
+| `flush` | Log-flush request and completion, including surrounding orchestration. |
+| `handoff` (host only) | Flush completion through the next bootloader's start checkpoint. |
+| `bootloader` (host only) | Bootloader start through its saved end checkpoint; includes sidecar setup. |
+| `kernel_init` (host only) | Bootloader tail, kernel boot, init process, VMM and transport startup, through VM worker initialization entry. |
+| `handoff_kernel_init` (kexec only) | Flush completion through VM worker initialization entry, without a bootloader run. |
+| `settings` | Read device platform settings and construct the thread pool. |
+| `state_read` | Retrieve and decode saved state from the host or persisted memory. |
+| `state_fixup` | Restore compatibility fixups, clear persisted kexec state, and prepare the timing ledger. |
+| `vm_build` | Reconstruct the VM, mappings, device managers, and channels. |
+| `restore` | Restore state units, including surrounding dispatch work. |
+| `restore_notify` | Report the restore result to the host; no host notification on kexec. |
+| `resume_wait` | Remaining worker setup and scheduling until VM start begins. |
+| `start` | Start state units through the existing blackout endpoint. |
+
+Kexec loads the extracted kernel and initrd directly and bypasses
+`openhcl_boot`. Any retained bootloader timestamps describe an earlier boot
+and must not be used for this transition. Compare its `handoff_kernel_init`
+with the sum of host servicing's `handoff`, `bootloader`, and `kernel_init`.
+The kexec interval includes serialization, local state persistence, sidecar
+preparation, kernel handoff, and startup of the new kernel and userspace.
+
+For host servicing, `handoff` includes serialization and host state
+transfer/restart. Separating host processing from transfer and restart
+requires host-side timestamps. Image staging before VM stop is outside
+blackout. Kernel and early userspace are deliberately grouped to avoid
+additional instrumentation in the kernel or init process.
+
+If a required timestamp is unavailable or moves backward, `phases=None`
+reports that the breakdown is unavailable instead of inventing durations.
+The original blackout measurement is unchanged. The early timing reader
+opens one hypercall handle per worker initialization; the kernel may log
+its allow-map setup. There are no serial writes for individual checkpoints.
+
+Keep device configuration, CPU count, keepalive settings, and logging levels
+the same when comparing runs. Kexec uses the existing NVMe keepalive
+configuration and servicing save/restore path, including pending-command
+handling. It still disables MANA keepalive, while host servicing may enable
+it. A difference in `save` or `shutdown` may therefore reflect keepalive
+policy rather than the restart mechanism.
+
+Do not mix `KERNEL_BOOT_TIME` (`CLOCK_BOOTTIME`) or bracketed kernel log
+timestamps with these checkpoints. They use different clock origins, and
+early boot timekeeping can differ from the log clock. Existing logging
+overhead remains included in the interval where it occurs.
+
 ## NVMe Keepalive Across Kexec
 
 Kexec honors `OPENHCL_NVME_KEEP_ALIVE` through the existing servicing path;
