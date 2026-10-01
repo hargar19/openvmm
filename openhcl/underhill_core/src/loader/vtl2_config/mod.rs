@@ -318,7 +318,7 @@ pub fn write_servicing_state_to_persisted(
         region.len(),
     );
 
-    tracing::info!(
+    tracing::debug!(
         CVM_ALLOWED,
         region = ?region,
         payload_len = state_buf.len(),
@@ -348,7 +348,7 @@ pub fn write_servicing_state_to_persisted(
 
     header_mapping.write_at(0, header.as_bytes())?;
 
-    tracing::info!(
+    tracing::debug!(
         CVM_ALLOWED,
         "persisted servicing state written successfully"
     );
@@ -372,12 +372,12 @@ pub fn read_servicing_state_from_persisted(
         .context("failed to read persisted state header")?;
 
     if header.magic != PersistedStateHeader::MAGIC {
-        tracing::info!(CVM_ALLOWED, "no valid persisted state header found");
+        tracing::debug!(CVM_ALLOWED, "no valid persisted state header found");
         return Ok(None);
     }
 
     if header.servicing_state_payload_len == 0 || header.servicing_state_base == 0 {
-        tracing::info!(
+        tracing::debug!(
             CVM_ALLOWED,
             "persisted header present but no servicing state stored"
         );

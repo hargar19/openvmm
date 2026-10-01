@@ -710,7 +710,7 @@ impl LoadedVm {
                 return Ok(());
             }
         };
-        tracing::info!(CVM_ALLOWED, %correlation_id, "incoming IGVM staged before VM stop");
+        tracing::debug!(CVM_ALLOWED, %correlation_id, "incoming IGVM staged before VM stop");
 
         let mut devices_shutdown = false;
         let nvme_keep_alive = self.nvme_keep_alive.clone();
@@ -774,7 +774,7 @@ impl LoadedVm {
                 current_online_cpus == staged_online_cpus,
                 "CPU ownership changed after kexec staging: {staged_online_cpus} -> {current_online_cpus}"
             );
-            tracing::info!(CVM_ALLOWED, %correlation_id, saved_state_len = state_buf.len(), "triggering guest-driven kexec reboot");
+            tracing::debug!(CVM_ALLOWED, %correlation_id, saved_state_len = state_buf.len(), "triggering guest-driven kexec reboot");
             Err(anyhow::Error::from(kexec_sys::kexec_reboot()).context("kexec reboot failed"))
         })();
         if let Err(cancel_err) = self.partition.cancel_sidecar_kexec() {
