@@ -113,3 +113,16 @@ At this point, the OpenHCL environment is fully established.
 The `underhill_vm` process runs the VTL0 guest, handling exits and coordinating device emulation. During VM initialization, security-sensitive devices requiring isolation (such as the virtual TPM) are spawned as dedicated **device worker processes** that run the emulation logic in separate, sandboxed processes. The VM worker proxies I/O operations and guest memory accesses between the guest and these isolated device emulators.
 
 Meanwhile, `openvmm_hcl` manages the overall policy and communicates with the host.
+
+## NVMe Keepalive Across Kexec
+
+Kexec honors `OPENHCL_NVME_KEEP_ALIVE` through the existing servicing path;
+there is no separate kexec opt-in. The existing VFIO and persistent-pool
+requirements still apply. NVMe driver state and DMA allocation metadata
+use the same servicing payload, stored and read in preserved memory rather
+than transferred through the host. Restore runs asynchronously as in host
+servicing, using the existing pending-I/O restore and drain behavior.
+
+No kexec-specific memory-map, reset-policy, or quiescent-I/O checks are added.
+The kernel's VF, DMA memory, and interrupt preservation across kexec still
+require validation on the target system.

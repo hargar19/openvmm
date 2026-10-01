@@ -719,7 +719,8 @@ impl LoadedVm {
             .handle_servicing_inner(
                 correlation_id,
                 deadline,
-                SaveGuestVtl2StateFlags::new(),
+                SaveGuestVtl2StateFlags::new()
+                    .with_enable_nvme_keepalive(self.nvme_keep_alive.is_enabled()),
                 &mut devices_shutdown,
             )
             .await;
