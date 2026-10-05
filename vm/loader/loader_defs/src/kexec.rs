@@ -278,10 +278,218 @@ impl BootHandoff {
     }
 }
 
+/// Offset of the optional [`SidecarPlan`] from the start of a composite image.
+pub const SIDECAR_PLAN_OFFSET: u64 = 5 * PAGE_ALIGNMENT;
+/// Offset of zeroed pages the bootstrap may use to extend the kexec page tables.
+pub const PAGE_TABLE_SCRATCH_OFFSET: u64 = 8 * PAGE_ALIGNMENT;
+/// Number of page-table scratch pages.
+pub const PAGE_TABLE_SCRATCH_PAGES: u64 = 8;
+/// Maximum number of sidecar nodes described by a [`SidecarPlan`].
+pub const MAX_SIDECAR_PLAN_CHUNKS: usize = 128;
+/// Bytes at the start of a kexec sidecar region for the sidecar image and record.
+pub const SIDECAR_REGION_IMAGE_SIZE: u64 = 512 * 1024;
+/// Sidecar maps its image with one large page, which must stay inside the region.
+pub const SIDECAR_REGION_MIN_SIZE: u64 = 2 * 1024 * 1024;
+/// Enable sidecar serial logging.
+pub const SIDECAR_PLAN_FLAG_LOGGING: u32 = 1;
+/// Root device-tree node describing the reserved kexec sidecar regions.
+pub const SIDECAR_DT_NODE_NAME: &str = "openhcl-kexec-sidecar";
+/// `u32` VP count property.
+pub const SIDECAR_DT_CPU_COUNT: &str = "cpu-count";
+/// `u64` image area size property.
+pub const SIDECAR_DT_IMAGE_SIZE: &str = "image-size";
+/// `u64` base/size pairs of the two regions.
+pub const SIDECAR_DT_REGIONS: &str = "regions";
+/// `u64` base VP, VP count, arena offset and arena size per sidecar node.
+pub const SIDECAR_DT_CHUNKS: &str = "chunks";
+
+/// One sidecar node inside a reserved kexec sidecar region.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout)]
+pub struct SidecarPlanChunk {
+    /// First VP of the node; Linux always owns it.
+    pub base_vp: u32,
+    /// Number of VPs in the node.
+    pub vp_count: u32,
+    /// Node memory offset from the region base.
+    pub arena_offset: u64,
+    /// Node memory size.
+    pub arena_size: u64,
+    /// Offset of the node's four-cell `reg` value in the carried-over device
+    /// tree, or zero if the device tree has no node to retarget.
+    pub dt_reg_offset: u32,
+    /// Must be zero.
+    pub reserved: u32,
+}
+
+/// Fresh sidecar assignment staged before the VM stops.
+///
+/// CPUs that must stay with Linux are only final after save, so the bootstrap
+/// reads them from a [`SidecarRecord`] at `region_base + record_offset`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout)]
+pub struct SidecarPlan {
+    /// Must be [`Self::MAGIC`].
+    pub magic: u64,
+    /// Must be [`Self::VERSION`].
+    pub version: u32,
+    /// Combination of `SIDECAR_PLAN_FLAG_*` values.
+    pub flags: u32,
+    /// Reserved region not used by the running sidecar.
+    pub region_base: u64,
+    /// Size of the reserved region.
+    pub region_size: u64,
+    /// Bytes at the region start for the sidecar image and the record.
+    pub image_size: u64,
+    /// Offset of the [`SidecarRecord`] page from the region base.
+    pub record_offset: u64,
+    /// Number of VPs in the partition.
+    pub cpu_count: u32,
+    /// Number of valid `chunks`.
+    pub chunk_count: u32,
+    /// Width of the space-padded `boot_cpus=` value in the staged command line.
+    pub boot_cpus_width: u32,
+    /// Must be zero.
+    pub reserved: u32,
+    /// Sidecar nodes, in device-tree order.
+    pub chunks: [SidecarPlanChunk; MAX_SIDECAR_PLAN_CHUNKS],
+}
+
+impl SidecarPlan {
+    /// Identifies a sidecar plan.
+    pub const MAGIC: u64 = u64::from_le_bytes(*b"OHCLSP01");
+    /// Plan layout version.
+    pub const VERSION: u32 = 1;
+
+    /// Returns the valid chunks.
+    pub fn chunks(&self) -> &[SidecarPlanChunk] {
+        &self.chunks[..(self.chunk_count as usize).min(MAX_SIDECAR_PLAN_CHUNKS)]
+    }
+
+    /// Validate invariants that do not depend on the incoming sidecar.
+    pub fn validate(&self) -> bool {
+        let page = PAGE_ALIGNMENT;
+        let Some(region_end) = self.region_base.checked_add(self.region_size) else {
+            return false;
+        };
+        if self.magic != Self::MAGIC
+            || self.version != Self::VERSION
+            || self.flags & !SIDECAR_PLAN_FLAG_LOGGING != 0
+            || self.reserved != 0
+            || self.region_base == 0
+            || !self.region_base.is_multiple_of(COMPOSITE_ALIGNMENT)
+            || self.region_size < SIDECAR_REGION_MIN_SIZE
+            || !self.region_size.is_multiple_of(page)
+            || region_end > 1 << 47
+            || self.image_size < 2 * page
+            || !self.image_size.is_multiple_of(page)
+            || self.image_size > self.region_size
+            || !self.record_offset.is_multiple_of(page)
+            || self
+                .record_offset
+                .checked_add(page)
+                .is_none_or(|end| end > self.image_size)
+            || self.chunk_count as usize > MAX_SIDECAR_PLAN_CHUNKS
+            || self.cpu_count == 0
+            || self.cpu_count > SidecarRecord::MAX_CPUS
+            || self.boot_cpus_width == 0
+        {
+            return false;
+        }
+        let mut next_cpu = 0;
+        let mut next_arena = self.image_size;
+        for chunk in self.chunks() {
+            let (Some(cpu_end), Some(arena_end)) = (
+                chunk.base_vp.checked_add(chunk.vp_count),
+                chunk.arena_offset.checked_add(chunk.arena_size),
+            ) else {
+                return false;
+            };
+            if chunk.vp_count < 2
+                || chunk.base_vp < next_cpu
+                || cpu_end > self.cpu_count
+                || chunk.arena_offset < next_arena
+                || !chunk.arena_offset.is_multiple_of(page)
+                || chunk.arena_size == 0
+                || !chunk.arena_size.is_multiple_of(page)
+                || arena_end > self.region_size
+                || chunk.reserved != 0
+            {
+                return false;
+            }
+            next_cpu = cpu_end;
+            next_arena = arena_end;
+        }
+        true
+    }
+}
+
+/// CPUs that must start in Linux, written by the predecessor after save.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, FromBytes, IntoBytes, Immutable, KnownLayout)]
+pub struct SidecarRecord {
+    /// Must be [`Self::MAGIC`].
+    pub magic: u64,
+    /// Must be [`Self::VERSION`].
+    pub version: u32,
+    /// Number of VPs in the partition.
+    pub cpu_count: u32,
+    /// Bitmap of CPUs with restored device interrupts.
+    pub kernel_cpus: [u64; 64],
+}
+
+impl SidecarRecord {
+    /// Identifies a sidecar record.
+    pub const MAGIC: u64 = u64::from_le_bytes(*b"OHCLSR01");
+    /// Record layout version.
+    pub const VERSION: u32 = 1;
+    /// Largest supported VP count.
+    pub const MAX_CPUS: u32 = 64 * 64;
+
+    /// Create an empty record.
+    pub fn new(cpu_count: u32) -> Self {
+        Self {
+            magic: Self::MAGIC,
+            version: Self::VERSION,
+            cpu_count,
+            kernel_cpus: [0; 64],
+        }
+    }
+
+    /// Require `cpu` to start in Linux. Returns false if it is out of range.
+    pub fn set_kernel_cpu(&mut self, cpu: u32) -> bool {
+        if cpu >= self.cpu_count || cpu >= Self::MAX_CPUS {
+            return false;
+        }
+        self.kernel_cpus[cpu as usize / 64] |= 1 << (cpu % 64);
+        true
+    }
+
+    /// Returns whether `cpu` must start in Linux.
+    pub fn kernel_cpu(&self, cpu: u32) -> bool {
+        cpu < Self::MAX_CPUS && self.kernel_cpus[cpu as usize / 64] & (1 << (cpu % 64)) != 0
+    }
+
+    /// Returns whether any CPU must start in Linux.
+    pub fn any_kernel_cpu(&self) -> bool {
+        self.kernel_cpus.iter().any(|&bits| bits != 0)
+    }
+
+    /// Check the header against the plan's VP count.
+    pub fn validate(&self, cpu_count: u32) -> bool {
+        self.magic == Self::MAGIC
+            && self.version == Self::VERSION
+            && self.cpu_count == cpu_count
+            && cpu_count <= Self::MAX_CPUS
+            && (cpu_count..Self::MAX_CPUS).all(|cpu| !self.kernel_cpu(cpu))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use test_with_tracing::test;
+    use zerocopy::FromZeros;
 
     #[test]
     fn composite_layout_relocates_above_four_gib() {
@@ -386,5 +594,80 @@ mod tests {
             ..valid
         };
         assert!(unaligned_params.validate(0x13000));
+    }
+
+    fn plan_fixture() -> SidecarPlan {
+        let mut plan = SidecarPlan::new_zeroed();
+        plan.magic = SidecarPlan::MAGIC;
+        plan.version = SidecarPlan::VERSION;
+        plan.region_base = 0x4000_0000;
+        plan.region_size = 0x40_0000;
+        plan.image_size = SIDECAR_REGION_IMAGE_SIZE;
+        plan.record_offset = SIDECAR_REGION_IMAGE_SIZE - PAGE_ALIGNMENT;
+        plan.cpu_count = 64;
+        plan.chunk_count = 2;
+        plan.boot_cpus_width = 64;
+        for (index, chunk) in plan.chunks[..2].iter_mut().enumerate() {
+            *chunk = SidecarPlanChunk {
+                base_vp: index as u32 * 32,
+                vp_count: 32,
+                arena_offset: SIDECAR_REGION_IMAGE_SIZE + index as u64 * 0x10_0000,
+                arena_size: 0x10_0000,
+                dt_reg_offset: 0x100 + index as u32 * 0x40,
+                reserved: 0,
+            };
+        }
+        plan
+    }
+
+    #[test]
+    fn sidecar_plan_layout_and_bounds() {
+        assert_eq!(size_of::<SidecarPlanChunk>(), 32);
+        assert_eq!(size_of::<SidecarPlan>(), 64 + 32 * MAX_SIDECAR_PLAN_CHUNKS);
+        const {
+            assert!(
+                SIDECAR_PLAN_OFFSET + size_of::<SidecarPlan>() as u64 <= PAGE_TABLE_SCRATCH_OFFSET
+            );
+            assert!(
+                PAGE_TABLE_SCRATCH_OFFSET + PAGE_TABLE_SCRATCH_PAGES * PAGE_ALIGNMENT
+                    <= COMPOSITE_ALIGNMENT
+            );
+        }
+        assert!(plan_fixture().validate());
+        for variant in 0..14 {
+            let mut plan = plan_fixture();
+            match variant {
+                0 => plan.magic = 0,
+                1 => plan.version += 1,
+                2 => plan.flags = 2,
+                3 => plan.region_base += PAGE_ALIGNMENT,
+                4 => plan.region_size = SIDECAR_REGION_MIN_SIZE - PAGE_ALIGNMENT,
+                5 => plan.record_offset = plan.image_size,
+                6 => plan.chunk_count = MAX_SIDECAR_PLAN_CHUNKS as u32 + 1,
+                7 => plan.cpu_count = 63,
+                8 => plan.chunks[0].vp_count = 1,
+                9 => plan.chunks[1].base_vp = 16,
+                10 => plan.chunks[0].arena_offset = 0,
+                11 => plan.chunks[1].arena_offset = plan.chunks[0].arena_offset,
+                12 => plan.chunks[1].arena_size = plan.region_size,
+                _ => plan.boot_cpus_width = 0,
+            }
+            assert!(!plan.validate(), "variant {variant}");
+        }
+    }
+
+    #[test]
+    fn sidecar_record_bits() {
+        let mut record = SidecarRecord::new(130);
+        assert!(record.validate(130));
+        assert!(!record.any_kernel_cpu());
+        assert!(record.set_kernel_cpu(0));
+        assert!(record.set_kernel_cpu(129));
+        assert!(!record.set_kernel_cpu(130));
+        assert!(record.kernel_cpu(0) && record.kernel_cpu(129) && !record.kernel_cpu(64));
+        assert!(record.any_kernel_cpu());
+        assert!(!record.validate(129));
+        record.kernel_cpus[63] = 1 << 63;
+        assert!(!record.validate(130));
     }
 }

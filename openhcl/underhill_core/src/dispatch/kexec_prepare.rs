@@ -4,7 +4,9 @@
 //! Extract matching kexec components from a servicing IGVM and stage supported payloads.
 
 mod composite;
+mod sidecar_plan;
 
+use crate::nvme_manager::save_restore_helpers::VPInterruptState;
 use anyhow::Context;
 use guest_emulation_transport::api::MAX_SERVICING_IGVM_SIZE;
 use igvm::IgvmDirectiveHeader;
@@ -26,6 +28,8 @@ use igvm_defs::IgvmPlatformType;
 use igvm_defs::IgvmVariableHeaderType;
 use igvm_defs::VbsVpContextHeader;
 use igvm_defs::VbsVpContextRegister;
+use loader_defs::kexec::SidecarPlan;
+use loader_defs::kexec::SidecarRecord;
 use loader_defs::paravisor::KexecPayloadDescriptor;
 use loader_defs::paravisor::KexecPayloadDescriptorV2;
 use loader_defs::paravisor::KexecPayloadDescriptorV3;
@@ -37,6 +41,7 @@ use object::LittleEndian;
 use object::read::elf::FileHeader;
 use std::collections::TryReserveError;
 use std::ffi::CString;
+use std::fmt::Write;
 use std::fs::File;
 use std::ops::Range;
 use std::os::fd::AsRawFd;
@@ -88,22 +93,42 @@ enum ExtractError {
     InvalidSidecar,
 }
 
-pub(super) fn prepare_kexec(igvm_data: &[u8], sidecar_running: bool) -> anyhow::Result<String> {
+/// Where the predecessor writes CPUs that must start in Linux, after save.
+#[derive(Debug)]
+pub(super) struct SidecarRecordTarget {
+    pub gpa: u64,
+    pub cpu_count: u32,
+}
+
+#[derive(Debug)]
+pub(super) struct StagedKexec {
+    pub online_cpus: String,
+    pub sidecar_record: Option<SidecarRecordTarget>,
+}
+
+pub(super) fn prepare_kexec(
+    igvm_data: &[u8],
+    sidecar_running: bool,
+) -> anyhow::Result<StagedKexec> {
     let payload = extract_payload(igvm_data).context("failed to extract servicing IGVM")?;
     anyhow::ensure!(
         payload.sidecar.is_none() || payload.bootstrap.is_some(),
         "incoming IGVM requires a fresh sidecar; missing kexec bootstrap (requires descriptor V3)"
     );
-    anyhow::ensure!(
-        payload.bootstrap.is_none() || !sidecar_running,
-        "composite bootstrap cannot retire an active sidecar yet"
-    );
     let raw_cmdline = std::fs::read_to_string("/proc/cmdline")
         .context("failed to read current kernel command line")?;
-    let cmdline = build_kexec_cmdline(&raw_cmdline)?;
+    let sidecar = match payload.bootstrap {
+        Some(_) => plan_sidecar(&raw_cmdline)?,
+        None => None,
+    };
+    anyhow::ensure!(
+        !sidecar_running || sidecar.is_some(),
+        "cannot replace the active sidecar without an incoming kexec bootstrap and reserved kexec sidecar regions"
+    );
+    let plan = sidecar.as_ref().map(|sidecar| &*sidecar.plan);
+    let cmdline = build_kexec_cmdline(&raw_cmdline, plan)?;
     let online_cpus = online_cpu_mask()?;
-    let kernel =
-        stage_kernel(&payload, &raw_cmdline).context("failed to stage servicing kernel")?;
+    let kernel = stage_kernel(&payload, plan).context("failed to stage servicing kernel")?;
     let initrd = stage_file(&payload.initrd, "openhcl-kexec-initrd")
         .context("failed to stage servicing initrd")?;
     drop(payload);
@@ -114,7 +139,53 @@ pub(super) fn prepare_kexec(igvm_data: &[u8], sidecar_running: bool) -> anyhow::
         kexec_sys::KEXEC_FILE_FORCE_DTB,
     )
     .context("kexec_file_load failed")?;
-    Ok(online_cpus)
+    Ok(StagedKexec {
+        online_cpus,
+        sidecar_record: sidecar.map(|sidecar| SidecarRecordTarget {
+            gpa: sidecar.record_gpa,
+            cpu_count: sidecar.plan.cpu_count,
+        }),
+    })
+}
+
+/// Build the record of CPUs whose restored device interrupts require Linux.
+pub(super) fn sidecar_record(
+    target: &SidecarRecordTarget,
+    interrupts: VPInterruptState,
+) -> SidecarRecord {
+    let mut record = SidecarRecord::new(target.cpu_count);
+    for &cpu in interrupts
+        .vps_with_outstanding_io
+        .iter()
+        .chain(&interrupts.vps_with_mapped_interrupts_no_io)
+    {
+        if !record.set_kernel_cpu(cpu) {
+            tracing::warn!(cpu, "restored interrupt CPU is outside the sidecar plan");
+        }
+    }
+    record
+}
+
+fn plan_sidecar(cmdline: &str) -> anyhow::Result<Option<sidecar_plan::SidecarStaging>> {
+    let fdt = match std::fs::read("/sys/firmware/fdt") {
+        Ok(fdt) => fdt,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(err).context("failed to read device tree"),
+    };
+    sidecar_plan::plan(&fdt, sidecar_logging(cmdline)).context("failed to plan kexec sidecar")
+}
+
+/// Mirrors the boot shim's `OPENHCL_SIDECAR=` parsing.
+fn sidecar_logging(cmdline: &str) -> bool {
+    cmdline
+        .split_whitespace()
+        .filter_map(|word| word.strip_prefix("OPENHCL_SIDECAR="))
+        .flat_map(|value| value.split(','))
+        .fold(false, |logging, item| match item {
+            "on" | "off" => false,
+            "log" => true,
+            _ => logging,
+        })
 }
 
 pub(super) fn online_cpu_mask() -> anyhow::Result<String> {
@@ -124,17 +195,24 @@ pub(super) fn online_cpu_mask() -> anyhow::Result<String> {
         .to_owned())
 }
 
-fn build_kexec_cmdline(raw: &str) -> anyhow::Result<CString> {
+/// The bootstrap narrows the padded all-CPU `boot_cpus=` value in place.
+fn build_kexec_cmdline(raw: &str, plan: Option<&SidecarPlan>) -> anyhow::Result<CString> {
     let raw = CString::new(raw).context("kernel command line contains a NUL byte")?;
-    let words: Vec<_> = raw
+    let mut cmdline = raw
         .to_str()?
         .split_whitespace()
         .filter(|word| {
             !word.starts_with("boot_cpus=") && !word.starts_with("OPENHCL_KEXEC_SERVICING=")
         })
-        .chain(std::iter::once("OPENHCL_KEXEC_SERVICING=1"))
-        .collect();
-    CString::new(words.join(" ")).context("invalid kexec command line")
+        .fold(String::new(), |cmdline, word| cmdline + word + " ");
+    if let Some(plan) = plan {
+        let value = format!("0-{}", plan.cpu_count - 1);
+        let width = plan.boot_cpus_width as usize;
+        anyhow::ensure!(value.len() <= width, "boot_cpus placeholder too narrow");
+        write!(cmdline, "boot_cpus={value:<width$} ")?;
+    }
+    cmdline.push_str("OPENHCL_KEXEC_SERVICING=1");
+    CString::new(cmdline).context("invalid kexec command line")
 }
 
 fn stage_file(data: &[u8], name: &str) -> anyhow::Result<File> {
@@ -146,27 +224,19 @@ fn stage_file(data: &[u8], name: &str) -> anyhow::Result<File> {
     Ok(file)
 }
 
-fn stage_kernel(payload: &Payload, cmdline: &str) -> anyhow::Result<File> {
+fn stage_kernel(payload: &Payload, plan: Option<&SidecarPlan>) -> anyhow::Result<File> {
     let Some(bootstrap) = &payload.bootstrap else {
         anyhow::ensure!(
-            payload.sidecar.is_none(),
+            payload.sidecar.is_none() && plan.is_none(),
             "sidecar requires a kexec bootstrap"
         );
         return stage_file(&payload.kernel, "openhcl-kexec-kernel");
     };
-    anyhow::ensure!(
-        cmdline
-            .split_whitespace()
-            .filter_map(|word| word.strip_prefix("OPENHCL_SIDECAR="))
-            .next_back()
-            == Some("off"),
-        "kexec bootstrap currently requires OPENHCL_SIDECAR=off; fresh sidecar CPU/memory handoff is not yet supported"
-    );
     let sidecar = payload
         .sidecar
         .as_ref()
         .context("bootstrap requires a sidecar payload")?;
-    composite::stage(&payload.kernel, sidecar, bootstrap)
+    composite::stage(&payload.kernel, sidecar, bootstrap, plan)
 }
 
 fn read_header<T: FromBytes + Immutable + KnownLayout>(data: &[u8]) -> Result<T, ExtractError> {
@@ -718,7 +788,7 @@ mod tests {
             ),
         }
         if payload.bootstrap.is_some() {
-            let mut composite = stage_kernel(&payload, "OPENHCL_SIDECAR=off")
+            let mut composite = stage_kernel(&payload, None)
                 .expect("generated components must produce a loader-compatible ELF");
             let mut bytes = Vec::new();
             composite.read_to_end(&mut bytes).unwrap();
@@ -1002,15 +1072,7 @@ mod tests {
             payload.bootstrap.as_deref(),
             Some(fixture.bootstrap.as_slice())
         );
-        for cmdline in [
-            "",
-            "OPENHCL_SIDECAR=on",
-            "OPENHCL_SIDECAR=log",
-            "OPENHCL_SIDECAR=off OPENHCL_SIDECAR=on",
-        ] {
-            assert!(stage_kernel(&payload, cmdline).is_err());
-        }
-        assert!(stage_kernel(&payload, "OPENHCL_SIDECAR=off").is_err());
+        assert!(stage_kernel(&payload, None).is_err());
         assert!(
             prepare_kexec(&fixture.image(), true)
                 .unwrap_err()
@@ -1762,15 +1824,43 @@ mod tests {
 
     #[test]
     fn cmdline_removes_all_stale_options_and_adds_one_marker() {
-        let cmdline = build_kexec_cmdline("console=ttyS0 boot_cpus=1 OPENHCL_KEXEC_SERVICING=0\nroot=/dev/ram0 boot_cpus=2 OPENHCL_KEXEC_SERVICING=1").unwrap();
+        let cmdline = build_kexec_cmdline("console=ttyS0 boot_cpus=1 OPENHCL_KEXEC_SERVICING=0\nroot=/dev/ram0 boot_cpus=2 OPENHCL_KEXEC_SERVICING=1", None).unwrap();
         assert_eq!(
             cmdline.to_str().unwrap(),
             "console=ttyS0 root=/dev/ram0 OPENHCL_KEXEC_SERVICING=1"
         );
         assert_eq!(
-            build_kexec_cmdline(" \n").unwrap().to_str().unwrap(),
+            build_kexec_cmdline(" \n", None).unwrap().to_str().unwrap(),
             "OPENHCL_KEXEC_SERVICING=1"
         );
+    }
+
+    #[test]
+    fn cmdline_pads_all_cpu_boot_cpus_placeholder() {
+        use zerocopy::FromZeros;
+        let mut plan = SidecarPlan::new_zeroed();
+        plan.cpu_count = 64;
+        plan.boot_cpus_width = 8;
+        let cmdline = build_kexec_cmdline("a boot_cpus=0,32 b", Some(&plan)).unwrap();
+        assert_eq!(
+            cmdline.to_str().unwrap(),
+            "a b boot_cpus=0-63     OPENHCL_KEXEC_SERVICING=1"
+        );
+        plan.boot_cpus_width = 3;
+        assert!(build_kexec_cmdline("a", Some(&plan)).is_err());
+    }
+
+    #[test]
+    fn sidecar_logging_matches_boot_shim_parsing() {
+        for (cmdline, logging) in [
+            ("", false),
+            ("OPENHCL_SIDECAR=log", true),
+            ("OPENHCL_SIDECAR=on,log", true),
+            ("OPENHCL_SIDECAR=log OPENHCL_SIDECAR=on", false),
+            ("OPENHCL_SIDECAR=log,bogus", true),
+        ] {
+            assert_eq!(sidecar_logging(cmdline), logging, "{cmdline}");
+        }
     }
 
     #[test]
@@ -1780,7 +1870,7 @@ mod tests {
             "boot_cpus=1\0",
             "OPENHCL_KEXEC_SERVICING=0\0",
         ] {
-            assert!(build_kexec_cmdline(raw).is_err());
+            assert!(build_kexec_cmdline(raw, None).is_err());
         }
     }
 }

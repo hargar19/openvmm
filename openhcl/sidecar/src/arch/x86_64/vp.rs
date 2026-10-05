@@ -58,6 +58,8 @@ pub unsafe fn ap_entry() -> ! {
     // concurrent accesses.
     let globals = unsafe { &mut *addr_space::globals() };
 
+    reset_stale_vp_state();
+
     // Set fs base to point to the CPU context, for use in `run_vp`.
     //
     // SAFETY: just getting the address.
@@ -143,6 +145,46 @@ pub unsafe fn ap_entry() -> ! {
     globals.cpu_status().store(CpuStatus::REMOVED.0, Release);
     raise_attention();
     park_until(|| None)
+}
+
+/// Disable overlays and SynIC state left by a previous kernel on this VP.
+///
+/// After kexec they can still target pages the new kernel has reused. Only
+/// enabled state is written, so a VP started from reset is unaffected.
+fn reset_stale_vp_state() {
+    // SAFETY: these synthetic MSRs are per-VP and do not alias Rust memory
+    // once disabled.
+    unsafe {
+        let disable = |msr: u32| {
+            if read_msr(msr) & 1 != 0 {
+                write_msr(msr, 0);
+            }
+        };
+        disable(hvdef::HV_X64_MSR_VP_ASSIST_PAGE);
+        disable(hvdef::HV_X64_MSR_SIMP);
+        disable(hvdef::HV_X64_MSR_SIEFP);
+        for timer in 0..4 {
+            disable(hvdef::HV_X64_MSR_STIMER0_CONFIG + 2 * timer);
+        }
+        for msr in hvdef::HV_X64_MSR_SINT0..=hvdef::HV_X64_MSR_SINT15 {
+            let sint = hvdef::HvSynicSint::from(read_msr(msr));
+            if !sint.masked() {
+                write_msr(msr, sint.with_masked(true).into());
+            }
+        }
+    }
+    let register_page = get_hv_vp_register(
+        HvInputVtl::CURRENT_VTL,
+        HvX64RegisterName::RegisterPage.into(),
+    )
+    .map(|value| hvdef::HvSynicSimpSiefp::from(value.as_u64()));
+    if register_page.is_ok_and(|page| page.enabled()) {
+        let _ = set_hv_vp_register(
+            HvInputVtl::CURRENT_VTL,
+            HvX64RegisterName::RegisterPage.into(),
+            0u64.into(),
+        );
+    }
 }
 
 fn map_overlays(globals: &mut VpGlobals) {

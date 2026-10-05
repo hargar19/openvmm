@@ -129,13 +129,36 @@ signed kexec images must authenticate the complete composite through a
 trusted signing flow. Automatic composite signing is not implemented.
 
 ```admonish warning
-The current test mode requires `OPENHCL_SIDECAR=off` and no active sidecar
-client in the running partition. It exercises kexec through the incoming bootstrap
-but does not start sidecar VPs. Fresh sidecar CPU assignment, predecessor
-retirement, and DT/E820 regeneration remain unimplemented and gated off.
-Both OpenHCL instances need the composite staging/entry implementation. The
-kernel requires only the pre-existing ELF/DTB/VTL2 kexec implementation.
+Fresh sidecar startup across kexec is experimental and has not been validated
+in a live transition. Both OpenHCL instances need the composite staging/entry
+implementation. The kernel needs the pre-existing ELF/DTB/VTL2 kexec support,
+the sidecar kexec preparation ioctls, and a sidecar driver that skips zeroed
+control pages.
 ```
+
+#### Fresh sidecar across kexec
+
+When the running boot started sidecar, `openhcl_boot` also reserves two
+equally sized kexec sidecar regions and describes them in the root
+`openhcl-kexec-sidecar` device-tree node (`cpu-count`, `image-size`,
+`regions`, and per-node `chunks`). Successive kexecs alternate between the
+regions, so a new sidecar never reuses memory from which a VP of the previous
+sidecar may still execute.
+
+Before stopping the VM, OpenHCL reads `/sys/firmware/fdt`, selects the region
+the running sidecar does not use, and stores a `SidecarPlan` in the composite
+metadata region. The plan records each node's memory and the offset of its
+device-tree `reg` value. The command line carries a space-padded all-CPU
+`boot_cpus=` value. After save, OpenHCL writes a `SidecarRecord` of CPUs with
+restored NVMe interrupts into the target region.
+
+The bootstrap maps the target region, reads the record, and assigns nodes with
+the boot shim's rules. It copies the incoming sidecar into the region, starts
+it, retargets the carried device tree's sidecar nodes, and narrows
+`boot_cpus=` in place. Nodes it does not start get a zeroed control page,
+which the Linux sidecar driver skips. A missing record, an oversized CPU list,
+or a sidecar that does not fit leaves every CPU with Linux. Sidecar clears
+overlay and SynIC state that the previous kernel left on each VP it starts.
 
 ### Delivery and transition
 

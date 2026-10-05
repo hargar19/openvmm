@@ -202,10 +202,11 @@ not just the kernel build directory's `drivers/...` files. The custom kernel
 resolver also expects `kernel_build_metadata.json` beside `vmlinux`.
 
 Add `--with-sidecar` to include the raw sidecar and boot-shim V3 payloads.
-Keep `OPENHCL_SIDECAR=off` for the current bootstrap-only transition test.
-Use the pre-existing ELF/DTB/VTL2 kexec kernel, without the custom bundle
-patches. First boot the updated image normally, then deliver that image
-through the kexec trigger. The running VM must have no active sidecar client. Omit this option
+With sidecar enabled, the running boot must also have reserved kexec sidecar
+regions; otherwise staging fails and the VM keeps running. First boot the
+updated image normally, then deliver that image through the kexec trigger.
+Use a kernel with the ELF/DTB/VTL2 kexec support and the sidecar kexec
+driver changes. Omit this option
 for the existing direct-to-Linux, no-sidecar kexec path.
 Without `--release`, the output
 for this customized recipe is

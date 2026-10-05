@@ -521,6 +521,34 @@ pub fn write_dt(
 
     root_builder = simple_bus_builder.end_node()?;
 
+    if let Some((sidecar, kexec)) = sidecar.and_then(|s| Some((s, s.kexec.as_ref()?))) {
+        let p_cpu_count = root_builder.add_string(loader_defs::kexec::SIDECAR_DT_CPU_COUNT)?;
+        let p_image_size = root_builder.add_string(loader_defs::kexec::SIDECAR_DT_IMAGE_SIZE)?;
+        let p_regions = root_builder.add_string(loader_defs::kexec::SIDECAR_DT_REGIONS)?;
+        let p_chunks = root_builder.add_string(loader_defs::kexec::SIDECAR_DT_CHUNKS)?;
+        let mut chunks =
+            off_stack!(ArrayVec<u64, { 4 * sidecar_defs::MAX_NODES }>, ArrayVec::new_const());
+        chunks.clear();
+        for (node, (offset, size)) in sidecar
+            .node_params
+            .iter()
+            .zip(kexec.arenas(sidecar.node_params))
+        {
+            chunks.extend([node.base_vp.into(), node.vp_count.into(), offset, size]);
+        }
+        let [first, second] = kexec.regions;
+        root_builder = root_builder
+            .start_node(loader_defs::kexec::SIDECAR_DT_NODE_NAME)?
+            .add_u32(p_cpu_count, sidecar.num_cpus as u32)?
+            .add_u64(p_image_size, kexec.image_size)?
+            .add_u64_array(
+                p_regions,
+                &[first.start(), first.len(), second.start(), second.len()],
+            )?
+            .add_u64_array(p_chunks, &chunks)?
+            .end_node()?;
+    }
+
     if cfg!(target_arch = "aarch64") {
         let p_bootargs = root_builder.add_string("bootargs")?;
         let p_initrd_start = root_builder.add_string("linux,initrd-start")?;

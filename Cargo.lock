@@ -8986,6 +8986,7 @@ dependencies = [
  "disk_get_vmgs",
  "disk_nvme",
  "disklayer_ram",
+ "fdt",
  "firmware_pcat",
  "firmware_uefi_resources",
  "framebuffer",

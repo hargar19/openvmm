@@ -702,8 +702,8 @@ impl LoadedVm {
 
         let staged = kexec_prepare::prepare_kexec(&igvm_data, self.partition.sidecar_enabled());
         drop(igvm_data);
-        let online_cpus = match staged {
-            Ok(online_cpus) => online_cpus,
+        let staged = match staged {
+            Ok(staged) => staged,
             Err(err) => {
                 tracelimit::error_ratelimited!(CVM_ALLOWED, %correlation_id, error = %format!("{err:#}"),
                     "guest-driven staging failed; VM remains running");
@@ -743,8 +743,21 @@ impl LoadedVm {
                 return Ok(());
             }
         };
+        let sidecar_record = staged.sidecar_record.as_ref().map(|target| {
+            kexec_prepare::sidecar_record(
+                target,
+                crate::nvme_manager::save_restore_helpers::nvme_interrupt_state(
+                    state.init_state.nvme_state.as_ref().map(|n| &n.nvme_state),
+                ),
+            )
+        });
         let state_buf = mesh::payload::encode(state);
-        let result = self.kexec_after_servicing(correlation_id, &state_buf, &online_cpus);
+        let result = self.kexec_after_servicing(
+            correlation_id,
+            &state_buf,
+            &staged,
+            sidecar_record.as_ref(),
+        );
         if let Err(err) = kexec_sys::kexec_file_unload() {
             tracing::error!(CVM_ALLOWED, error = %err, "failed to unload kernel after kexec failure");
         }
@@ -760,18 +773,27 @@ impl LoadedVm {
         &self,
         correlation_id: Guid,
         state_buf: &[u8],
-        staged_online_cpus: &str,
+        staged: &kexec_prepare::StagedKexec,
+        sidecar_record: Option<&loader_defs::kexec::SidecarRecord>,
     ) -> anyhow::Result<()> {
         let parsed = self.runtime_params.parsed_openhcl_boot();
         crate::loader::vtl2_config::write_servicing_state_to_persisted(parsed, state_buf)
             .context("failed to persist servicing state for kexec")?;
+        if let Some((target, record)) = staged.sidecar_record.as_ref().zip(sidecar_record) {
+            crate::loader::vtl2_config::write_reserved_vtl2_memory(
+                target.gpa,
+                zerocopy::IntoBytes::as_bytes(record),
+            )
+            .context("failed to write kexec sidecar record")?;
+        }
         self.partition
             .prepare_sidecar_for_kexec()
             .context("sidecar is not ready for kexec")?;
+        let staged_online_cpus = &staged.online_cpus;
         let result = (|| {
             let current_online_cpus = kexec_prepare::online_cpu_mask()?;
             anyhow::ensure!(
-                current_online_cpus == staged_online_cpus,
+                current_online_cpus == *staged_online_cpus,
                 "CPU ownership changed after kexec staging: {staged_online_cpus} -> {current_online_cpus}"
             );
             tracing::debug!(CVM_ALLOWED, %correlation_id, saved_state_len = state_buf.len(), "triggering guest-driven kexec reboot");

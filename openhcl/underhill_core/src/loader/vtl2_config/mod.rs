@@ -356,6 +356,16 @@ pub fn write_servicing_state_to_persisted(
     Ok(())
 }
 
+/// Write `data` to reserved VTL2 memory that the kernel does not manage.
+pub fn write_reserved_vtl2_memory(gpa: u64, data: &[u8]) -> anyhow::Result<()> {
+    let start = gpa & !(HV_PAGE_SIZE - 1);
+    let end = (gpa + data.len() as u64).next_multiple_of(HV_PAGE_SIZE);
+    let ranges = [MemoryRange::new(start..end)];
+    Vtl2ParamsMap::new_writeable(&ranges)
+        .context("failed to map reserved VTL2 memory")?
+        .write_at((gpa - start) as usize, data)
+}
+
 /// Read servicing state from the persisted servicing state region after a kexec
 /// restart. Returns `None` if no servicing state is stored.
 pub fn read_servicing_state_from_persisted(

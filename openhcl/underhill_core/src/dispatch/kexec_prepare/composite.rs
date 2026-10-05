@@ -10,6 +10,8 @@ use loader_defs::kexec::COMPOSITE_ENTRY_MAGIC;
 use loader_defs::kexec::COMPOSITE_NOTE_NAME;
 use loader_defs::kexec::COMPOSITE_NOTE_TYPE;
 use loader_defs::kexec::CompositeHeader;
+use loader_defs::kexec::SIDECAR_PLAN_OFFSET;
+use loader_defs::kexec::SidecarPlan;
 use object::LittleEndian as LE;
 use object::elf;
 use object::read::elf::FileHeader;
@@ -197,7 +199,12 @@ fn find_composite_entry(data: &[u8], header: &elf::FileHeader64<LE>) -> anyhow::
     entry.context("bootstrap lacks composite entry note; rebuild the incoming IGVM")
 }
 
-pub(super) fn stage(kernel: &[u8], sidecar: &[u8], bootstrap: &[u8]) -> anyhow::Result<File> {
+pub(super) fn stage(
+    kernel: &[u8],
+    sidecar: &[u8],
+    bootstrap: &[u8],
+    plan: Option<&SidecarPlan>,
+) -> anyhow::Result<File> {
     let kernel = Image::parse(kernel, false, false).context("invalid Linux ELF")?;
     let sidecar = Image::parse(sidecar, true, false).context("invalid sidecar ELF")?;
     let bootstrap = Image::parse(bootstrap, true, true).context("invalid bootstrap ELF")?;
@@ -281,6 +288,10 @@ pub(super) fn stage(kernel: &[u8], sidecar: &[u8], bootstrap: &[u8]) -> anyhow::
         file.write_all_at(object::pod::bytes_of(&program), 64 + index as u64 * 56)?;
     }
     file.write_all_at(layout.as_bytes(), ALIGN)?;
+    if let Some(plan) = plan {
+        ensure!(plan.validate(), "invalid sidecar plan");
+        file.write_all_at(plan.as_bytes(), ALIGN + SIDECAR_PLAN_OFFSET)?;
+    }
     bootstrap.write(&file, layout.bootstrap.base)?;
     sidecar.write(&file, layout.sidecar.base)?;
     kernel.write(&file, layout.kernel.base)?;
@@ -329,7 +340,7 @@ mod tests {
         let kernel = kernel_fixture();
         let sidecar = companion(false);
         let bootstrap = companion(true);
-        let mut file = stage(&kernel, &sidecar, &bootstrap).unwrap();
+        let mut file = stage(&kernel, &sidecar, &bootstrap, None).unwrap();
         let mut bytes = Vec::new();
         file.read_to_end(&mut bytes).unwrap();
         let header = elf::FileHeader64::<LE>::parse(bytes.as_slice()).unwrap();
@@ -374,7 +385,7 @@ mod tests {
     fn composite_rejects_missing_or_invalid_entry_note() {
         let kernel = kernel_fixture();
         let sidecar = companion(false);
-        assert!(stage(&kernel, &sidecar, &sidecar).is_err());
+        assert!(stage(&kernel, &sidecar, &sidecar, None).is_err());
         for variant in 0..4 {
             let mut bootstrap = companion(true);
             match variant {
@@ -383,7 +394,7 @@ mod tests {
                 2 => bootstrap[0x21c..0x224].copy_from_slice(&0x10000000i64.to_le_bytes()),
                 _ => bootstrap[0x204..0x208].copy_from_slice(&0xffffu32.to_le_bytes()),
             }
-            assert!(stage(&kernel, &sidecar, &bootstrap).is_err());
+            assert!(stage(&kernel, &sidecar, &bootstrap, None).is_err());
         }
     }
 
@@ -423,7 +434,7 @@ mod tests {
         };
         sidecar[120..176].copy_from_slice(object::pod::bytes_of(&segment));
         sidecar[0x1123..0x1143].fill(0xa5);
-        let file = stage(&kernel_fixture(), &sidecar, &companion(true)).unwrap();
+        let file = stage(&kernel_fixture(), &sidecar, &companion(true), None).unwrap();
         let mut header_bytes = [0; size_of::<CompositeHeader>()];
         file.read_exact_at(&mut header_bytes, ALIGN).unwrap();
         let layout = CompositeHeader::read_from_bytes(&header_bytes).unwrap();
@@ -434,13 +445,37 @@ mod tests {
         assert_eq!(&bytes[0x2123..0x2143], &[0xa5; 0x20]);
         assert!(bytes[0x2143..].iter().all(|&byte| byte == 0));
         sidecar[128..136].copy_from_slice(&0x1124u64.to_le_bytes());
-        assert!(stage(&kernel_fixture(), &sidecar, &companion(true)).is_err());
+        assert!(stage(&kernel_fixture(), &sidecar, &companion(true), None).is_err());
     }
 
     #[test]
     fn composite_accepts_linux_init_entry_without_execute_flag() {
         let mut kernel = kernel_fixture();
         kernel[68..72].copy_from_slice(&(elf::PF_R | elf::PF_W).to_le_bytes());
-        assert!(stage(&kernel, &companion(false), &companion(true)).is_ok());
+        assert!(stage(&kernel, &companion(false), &companion(true), None).is_ok());
+    }
+
+    #[test]
+    fn composite_carries_validated_sidecar_plan() {
+        use loader_defs::kexec::SIDECAR_REGION_IMAGE_SIZE;
+        use zerocopy::FromZeros;
+
+        let mut plan = SidecarPlan::new_zeroed();
+        plan.magic = SidecarPlan::MAGIC;
+        plan.version = SidecarPlan::VERSION;
+        plan.region_base = 0x4000_0000;
+        plan.region_size = 0x20_0000;
+        plan.image_size = SIDECAR_REGION_IMAGE_SIZE;
+        plan.record_offset = SIDECAR_REGION_IMAGE_SIZE - 4096;
+        plan.cpu_count = 4;
+        plan.boot_cpus_width = 64;
+        let parts = (kernel_fixture(), companion(false), companion(true));
+        let file = stage(&parts.0, &parts.1, &parts.2, Some(&plan)).unwrap();
+        let mut bytes = vec![0; size_of::<SidecarPlan>()];
+        file.read_exact_at(&mut bytes, ALIGN + SIDECAR_PLAN_OFFSET)
+            .unwrap();
+        assert_eq!(bytes, plan.as_bytes());
+        plan.magic = 0;
+        assert!(stage(&parts.0, &parts.1, &parts.2, Some(&plan)).is_err());
     }
 }

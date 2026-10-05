@@ -20,7 +20,7 @@ const PAGE_SIZE_4K: u64 = 4096;
 
 /// The maximum number of reserved memory ranges that we might use.
 /// See [`ReservedMemoryType`] definition for details.
-pub const MAX_RESERVED_MEM_RANGES: usize = 7 + sidecar_defs::MAX_NODES;
+pub const MAX_RESERVED_MEM_RANGES: usize = 8 + sidecar_defs::MAX_NODES;
 
 const MAX_MEMORY_RANGES: usize = MAX_VTL2_RAM_RANGES + MAX_RESERVED_MEM_RANGES;
 
@@ -543,7 +543,6 @@ impl AddressSpaceManager {
     ///
     /// `alignment` aligns the top of HighMemory allocations to `alignment`
     /// bytes, and aligns the bottom of LowMemory allocations
-    #[cfg_attr(all(target_arch = "aarch64", not(test)), expect(dead_code))]
     pub fn allocate_aligned(
         &mut self,
         required_vnode: Option<u32>,

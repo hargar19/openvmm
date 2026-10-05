@@ -10,6 +10,10 @@ use crate::host_params::shim_params::ShimParams;
 use crate::memory::AddressSpaceManager;
 use crate::memory::AllocationPolicy;
 use crate::memory::AllocationType;
+use loader_defs::kexec::COMPOSITE_ALIGNMENT;
+use loader_defs::kexec::SIDECAR_REGION_IMAGE_SIZE;
+use loader_defs::kexec::SIDECAR_REGION_MIN_SIZE;
+use memory_range::MemoryRange;
 use sidecar_defs::SidecarNodeOutput;
 use sidecar_defs::SidecarNodeParams;
 use sidecar_defs::SidecarOutput;
@@ -32,6 +36,58 @@ pub struct SidecarConfig<'a> {
     pub nodes: &'a [SidecarNodeOutput],
     pub start_reftime: u64,
     pub end_reftime: u64,
+    pub kexec: Option<KexecSidecarRegions>,
+}
+
+/// Two reserved regions that guest-driven kexec alternates between, so a new
+/// sidecar never reuses memory the previous sidecar may still execute from.
+pub struct KexecSidecarRegions {
+    pub regions: [MemoryRange; 2],
+    pub image_size: u64,
+}
+
+impl KexecSidecarRegions {
+    /// Returns the region offset and size of each node's memory.
+    pub fn arenas<'a>(
+        &self,
+        nodes: &'a [SidecarNodeParams],
+    ) -> impl Iterator<Item = (u64, u64)> + use<'a> {
+        nodes.iter().scan(self.image_size, |offset, node| {
+            let size = sidecar_defs::required_memory(node.vp_count) as u64;
+            let arena = (*offset, size);
+            *offset += size;
+            Some(arena)
+        })
+    }
+}
+
+fn reserve_kexec_regions(
+    address_space: &mut AddressSpaceManager,
+    nodes: &[SidecarNodeParams],
+) -> Option<KexecSidecarRegions> {
+    let size = nodes
+        .iter()
+        .map(|node| sidecar_defs::required_memory(node.vp_count) as u64)
+        .sum::<u64>()
+        .checked_add(SIDECAR_REGION_IMAGE_SIZE)?
+        .max(SIDECAR_REGION_MIN_SIZE)
+        .next_multiple_of(COMPOSITE_ALIGNMENT);
+    let Some(mem) = address_space.allocate_aligned(
+        None,
+        2 * size,
+        AllocationType::SidecarNode,
+        AllocationPolicy::LowMemory,
+        COMPOSITE_ALIGNMENT,
+    ) else {
+        log::warn!("sidecar: not enough memory for kexec sidecar regions");
+        return None;
+    };
+    let (first, second) = mem.range.split_at_offset(size);
+    log::info!("sidecar: reserved kexec regions {first:#x?} and {second:#x?}");
+    Some(KexecSidecarRegions {
+        regions: [first, second],
+        image_size: SIDECAR_REGION_IMAGE_SIZE,
+    })
 }
 
 impl SidecarConfig<'_> {
@@ -273,6 +329,7 @@ pub fn start_sidecar<'a>(
         log::info!("sidecar: no nodes have sidecar-started APs; disabling sidecar");
         return None;
     }
+    let kexec = reserve_kexec_regions(address_space, &sidecar_params.nodes[..node_count]);
 
     // SAFETY: the parameter blob is trusted.
     let sidecar_entry: extern "C" fn(&SidecarParams, &mut SidecarOutput) -> bool =
@@ -302,6 +359,7 @@ pub fn start_sidecar<'a>(
         node_params: &sidecar_params.nodes[..node_count],
         nodes: &nodes[..node_count],
         per_cpu_state: &sidecar_params.initial_state,
+        kexec,
     };
     log::info!(
         "sidecar: boot_cpus parameter: {}",
