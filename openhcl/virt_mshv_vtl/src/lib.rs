@@ -878,6 +878,11 @@ impl UhPartition {
         self.inner.hcl.prepare_sidecar_for_kexec()
     }
 
+    /// Returns whether this partition has an active sidecar client.
+    pub fn sidecar_enabled(&self) -> bool {
+        self.inner.hcl.sidecar_enabled()
+    }
+
     /// Cancel sidecar kexec preparation after a failed reboot attempt.
     pub fn cancel_sidecar_kexec(&self) -> Result<(), sidecar_client::SidecarError> {
         self.inner.hcl.cancel_sidecar_kexec()

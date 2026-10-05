@@ -1656,6 +1656,8 @@ mod custom_binary_tests {
     use hvdef::HV_PAGE_SIZE;
     use igvm::IgvmDirectiveHeader;
     use loader_defs::paravisor::KexecPayloadDescriptor;
+    use loader_defs::paravisor::KexecPayloadDescriptorV2;
+    use loader_defs::paravisor::KexecPayloadDescriptorV3;
     use loader_defs::paravisor::ParavisorMeasuredVtl2Config;
     use loader_defs::paravisor::kexec_payload_descriptor_offset;
     use object::LittleEndian;
@@ -1730,6 +1732,15 @@ mod custom_binary_tests {
         initrd_bytes: &[u8],
         isolation_type: LoaderIsolationType,
     ) -> Result<IgvmFile, loader::paravisor::Error> {
+        test_image_with_sidecar::<R>(binary, initrd_bytes, isolation_type, None)
+    }
+
+    fn test_image_with_sidecar<R: IgvmfilegenRegister + GuestArch>(
+        binary: Option<&[u8]>,
+        initrd_bytes: &[u8],
+        isolation_type: LoaderIsolationType,
+        sidecar_bytes: Option<&[u8]>,
+    ) -> Result<IgvmFile, loader::paravisor::Error> {
         let (kernel_bytes, machine) = match R::arch() {
             GuestArchKind::X86_64 => (test_elf(elf::EM_X86_64), elf::EM_X86_64),
             GuestArchKind::Aarch64 => {
@@ -1749,6 +1760,7 @@ mod custom_binary_tests {
         };
         let mut kernel = Cursor::new(kernel_bytes);
         let mut shim = Cursor::new(test_elf(machine));
+        let mut sidecar = sidecar_bytes.map(|bytes| Cursor::new(bytes.to_vec()));
         let mut initrd = Cursor::new(initrd_bytes);
         let mut binary_file = binary.map(Cursor::new);
         let custom_binary = binary_file.as_mut().map(|file| {
@@ -1761,7 +1773,7 @@ mod custom_binary_tests {
             &mut loader.loader(),
             &mut kernel,
             &mut shim,
-            None,
+            sidecar.as_mut(),
             CommandLineType::Static(""),
             Some((&mut initrd, initrd_bytes.len() as u64)),
             custom_binary,
@@ -1856,6 +1868,52 @@ mod custom_binary_tests {
     #[test]
     fn custom_binary_x64_measured_pages_and_descriptor() {
         check_custom_binary::<X86Register>();
+    }
+
+    #[test]
+    fn custom_binary_x64_sidecar_preserves_raw_elf() {
+        let binary = test_elf(elf::EM_X86_64);
+        let initrd = [0x5a; 13];
+        let mut sidecar = test_elf(elf::EM_X86_64);
+        sidecar.extend_from_slice(&[0xa7; 17]);
+        let image = test_image_with_sidecar::<X86Register>(
+            Some(&binary),
+            &initrd,
+            LoaderIsolationType::None,
+            Some(&sidecar),
+        )
+        .unwrap();
+        let page = measured_config_page(&image);
+        let (config, _) = ParavisorMeasuredVtl2Config::read_from_prefix(page).unwrap();
+        let offset = kexec_payload_descriptor_offset(config.product_policy_size).unwrap();
+        let (descriptor, _) = KexecPayloadDescriptorV2::read_from_prefix(&page[offset..]).unwrap();
+        assert_eq!(descriptor.common.magic, KexecPayloadDescriptor::MAGIC);
+        assert_eq!(descriptor.common.version, KexecPayloadDescriptorV3::VERSION);
+        assert_eq!(descriptor.common.reserved, 0);
+        assert_eq!(descriptor.sidecar_size, sidecar.len() as u64);
+        assert!(
+            descriptor.sidecar_base
+                >= descriptor.common.custom_binary_base + descriptor.common.custom_binary_size
+        );
+        check_payload_pages(&image, descriptor.common.custom_binary_base, &binary);
+        check_payload_pages(&image, descriptor.common.initrd_base, &initrd);
+        check_payload_pages(&image, descriptor.sidecar_base, &sidecar);
+        let (descriptor, _) = KexecPayloadDescriptorV3::read_from_prefix(&page[offset..]).unwrap();
+        let bootstrap = test_elf(elf::EM_X86_64);
+        assert_eq!(descriptor.bootstrap_size, bootstrap.len() as u64);
+        check_payload_pages(&image, descriptor.bootstrap_base, &bootstrap);
+        let legacy = test_image_with_sidecar::<X86Register>(
+            None,
+            &initrd,
+            LoaderIsolationType::None,
+            Some(&sidecar),
+        )
+        .unwrap();
+        assert!(
+            measured_config_page(&legacy)[offset..]
+                .iter()
+                .all(|&byte| byte == 0)
+        );
     }
 
     #[test]

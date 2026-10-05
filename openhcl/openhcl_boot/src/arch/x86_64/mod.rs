@@ -71,4 +71,6 @@ core::arch::global_asm! {
     stack = sym crate::rt::STACK,
     STACK_COOKIE = const crate::rt::STACK_COOKIE,
     STACK_SIZE = const crate::rt::STACK_SIZE,
+    COMPOSITE_ENTRY_MAGIC = const loader_defs::kexec::COMPOSITE_ENTRY_MAGIC,
+    COMPOSITE_NOTE_TYPE = const loader_defs::kexec::COMPOSITE_NOTE_TYPE,
 }

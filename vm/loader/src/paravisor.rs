@@ -110,6 +110,10 @@ pub enum Error {
     CustomBinaryAddressOverflow,
     #[error("failed to import custom binary")]
     ImportCustomBinary(#[source] crate::common::ImportFileRegionError),
+    #[error("failed to determine raw kexec sidecar size")]
+    KexecSidecarSize(#[source] std::io::Error),
+    #[error("failed to determine raw kexec bootstrap size")]
+    KexecBootstrapSize(#[source] std::io::Error),
     #[error(
         "product policy of {0} bytes leaves insufficient room for the kexec payload descriptor in the measured VTL2 config region"
     )]
@@ -165,6 +169,34 @@ fn validate_product_policy_for_build(policy: &ProductPolicy) {
     }
 }
 
+#[derive(Clone, Copy)]
+enum KexecPayload {
+    V1(KexecPayloadDescriptor),
+    #[cfg(test)]
+    V2(KexecPayloadDescriptorV2),
+    V3(KexecPayloadDescriptorV3),
+}
+
+impl KexecPayload {
+    fn version(&self) -> u32 {
+        match self {
+            Self::V1(_) => KexecPayloadDescriptor::VERSION,
+            #[cfg(test)]
+            Self::V2(_) => KexecPayloadDescriptorV2::VERSION,
+            Self::V3(_) => KexecPayloadDescriptorV3::VERSION,
+        }
+    }
+
+    fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::V1(descriptor) => descriptor.as_bytes(),
+            #[cfg(test)]
+            Self::V2(descriptor) => descriptor.as_bytes(),
+            Self::V3(descriptor) => descriptor.as_bytes(),
+        }
+    }
+}
+
 /// Build the fixed-size measured VTL2 config region image: the struct
 /// followed by the optional (encoded) product policy body, zero-padded
 /// to `PARAVISOR_MEASURED_VTL2_CONFIG_SIZE_PAGES * HV_PAGE_SIZE`. Every
@@ -172,17 +204,21 @@ fn validate_product_policy_for_build(policy: &ProductPolicy) {
 fn build_measured_vtl2_config_region(
     mut config: ParavisorMeasuredVtl2Config,
     product_policy: Option<&ProductPolicy>,
-    kexec_payload: Option<KexecPayloadDescriptor>,
+    kexec_payload: Option<KexecPayload>,
 ) -> Result<Vec<u8>, Error> {
     let policy_bytes = product_policy.map(encode_product_policy_bytes);
     let policy_bytes = policy_bytes.as_deref().unwrap_or(&[]);
     config.product_policy_size = policy_bytes.len() as u32;
 
     let descriptor_offset = kexec_payload
-        .map(|_| {
-            kexec_payload_descriptor_offset(config.product_policy_size).ok_or(
-                Error::KexecPayloadDescriptorSpace(config.product_policy_size),
+        .map(|descriptor| {
+            kexec_payload_descriptor_offset_for_version(
+                config.product_policy_size,
+                descriptor.version(),
             )
+            .ok_or(Error::KexecPayloadDescriptorSpace(
+                config.product_policy_size,
+            ))
         })
         .transpose()?;
     let buf_bytes = (PARAVISOR_MEASURED_VTL2_CONFIG_SIZE_PAGES as usize) * (HV_PAGE_SIZE as usize);
@@ -195,8 +231,7 @@ fn build_measured_vtl2_config_region(
         buf[off..off + policy_bytes.len()].copy_from_slice(policy_bytes);
     }
     if let Some((descriptor, offset)) = kexec_payload.zip(descriptor_offset) {
-        buf[offset..offset + size_of::<KexecPayloadDescriptor>()]
-            .copy_from_slice(descriptor.as_bytes());
+        buf[offset..offset + descriptor.as_bytes().len()].copy_from_slice(descriptor.as_bytes());
     }
     Ok(buf)
 }
@@ -231,6 +266,35 @@ fn import_custom_binary<R: GuestArch>(
     if initrd_size == 0 {
         return Err(Error::CustomBinaryRequiresInitrd);
     }
+    let base = import_raw_kexec_payload(
+        importer,
+        file,
+        size,
+        next_address,
+        memory_start,
+        memory_size,
+        "underhill-custom-binary",
+    )?;
+    Ok(Some(KexecPayloadDescriptor {
+        magic: KexecPayloadDescriptor::MAGIC,
+        version: KexecPayloadDescriptor::VERSION,
+        reserved: 0,
+        initrd_base,
+        initrd_size,
+        custom_binary_base: base,
+        custom_binary_size: size,
+    }))
+}
+
+fn import_raw_kexec_payload<R: GuestArch>(
+    importer: &mut dyn ImageLoad<R>,
+    file: &mut dyn ReadSeek,
+    size: u64,
+    next_address: &mut u64,
+    memory_start: u64,
+    memory_size: u64,
+    tag: &'static str,
+) -> Result<u64, Error> {
     let base = *next_address;
     let end = custom_binary_end(base, size)?;
     let memory_end = memory_start
@@ -249,20 +313,12 @@ fn import_custom_binary<R: GuestArch>(
                 gpa: base,
                 memory_length: size,
                 acceptance: BootPageAcceptance::Exclusive,
-                tag: "underhill-custom-binary",
+                tag,
             },
         )
         .map_err(Error::ImportCustomBinary)?;
     *next_address = end;
-    Ok(Some(KexecPayloadDescriptor {
-        magic: KexecPayloadDescriptor::MAGIC,
-        version: KexecPayloadDescriptor::VERSION,
-        reserved: 0,
-        initrd_base,
-        initrd_size,
-        custom_binary_base: base,
-        custom_binary_size: size,
-    }))
+    Ok(base)
 }
 
 /// Kernel Command line type.
@@ -286,7 +342,7 @@ pub fn load_openhcl_x64<F>(
     importer: &mut dyn ImageLoad<X86Register>,
     kernel_image: &mut F,
     shim: &mut F,
-    sidecar: Option<&mut F>,
+    mut sidecar: Option<&mut F>,
     command_line: CommandLineType<'_>,
     mut initrd: Option<(&mut dyn ReadSeek, u64)>,
     custom_binary: Option<(&mut dyn ReadSeek, u64)>,
@@ -415,7 +471,7 @@ where
     assert_eq!(offset & (HV_PAGE_SIZE - 1), 0);
 
     // If an AP kernel was provided, load it next.
-    let (sidecar_size, sidecar_entrypoint) = if let Some(sidecar) = sidecar {
+    let (sidecar_size, sidecar_entrypoint) = if let Some(sidecar) = sidecar.as_deref_mut() {
         // Sidecar load addr must be 2MB aligned
         offset = align_up_to_large_page_size(offset);
 
@@ -500,6 +556,46 @@ where
         memory_start_address,
         memory_size,
     )?;
+    let kexec_payload = match (kexec_payload, sidecar) {
+        (Some(mut common), Some(sidecar)) => {
+            let sidecar_size = sidecar
+                .seek(std::io::SeekFrom::End(0))
+                .map_err(Error::KexecSidecarSize)?;
+            let sidecar_base = import_raw_kexec_payload(
+                importer,
+                sidecar,
+                sidecar_size,
+                &mut offset,
+                memory_start_address,
+                memory_size,
+                "underhill-kexec-sidecar",
+            )?;
+            let bootstrap_size = shim
+                .seek(std::io::SeekFrom::End(0))
+                .map_err(Error::KexecBootstrapSize)?;
+            let bootstrap_base = import_raw_kexec_payload(
+                importer,
+                shim,
+                bootstrap_size,
+                &mut offset,
+                memory_start_address,
+                memory_size,
+                "underhill-kexec-bootstrap",
+            )?;
+            common.version = KexecPayloadDescriptorV3::VERSION;
+            Some(KexecPayload::V3(KexecPayloadDescriptorV3 {
+                common: KexecPayloadDescriptorV2 {
+                    common,
+                    sidecar_base,
+                    sidecar_size,
+                },
+                bootstrap_base,
+                bootstrap_size,
+            }))
+        }
+        (Some(descriptor), None) => Some(KexecPayload::V1(descriptor)),
+        (None, _) => None,
+    };
 
     let gdt_base_address = offset;
     let gdt_size = HV_PAGE_SIZE;
@@ -1654,8 +1750,11 @@ where
         reserved: [0; 4],
     };
 
-    let region_image =
-        build_measured_vtl2_config_region(vtl2_measured_config, product_policy, kexec_payload)?;
+    let region_image = build_measured_vtl2_config_region(
+        vtl2_measured_config,
+        product_policy,
+        kexec_payload.map(KexecPayload::V1),
+    )?;
 
     importer
         .import_pages(
@@ -1830,9 +1929,12 @@ mod product_policy_tests {
         });
         for policy in [None, Some(&policy)] {
             let descriptor = payload_descriptor();
-            let region =
-                build_measured_vtl2_config_region(empty_config(), policy, Some(descriptor))
-                    .unwrap();
+            let region = build_measured_vtl2_config_region(
+                empty_config(),
+                policy,
+                Some(KexecPayload::V1(descriptor)),
+            )
+            .unwrap();
             let legacy = build_measured_vtl2_config_region(empty_config(), policy, None).unwrap();
             let (config, _) = ParavisorMeasuredVtl2Config::ref_from_prefix(&region).unwrap();
             let offset = kexec_payload_descriptor_offset(config.product_policy_size).unwrap();
@@ -1867,9 +1969,42 @@ mod product_policy_tests {
             build_measured_vtl2_config_region(
                 empty_config(),
                 Some(&policy),
-                Some(payload_descriptor())
+                Some(KexecPayload::V1(payload_descriptor()))
             ),
             Err(Error::KexecPayloadDescriptorSpace(size)) if size == config.product_policy_size
         ));
+    }
+
+    #[test]
+    fn build_region_v2_descriptor_preserves_policy_and_raw_sidecar_size() {
+        let policy = ProductPolicy::Sivm(SivmPolicy {
+            custom_uefi_json: vec![1, 2, 3],
+            ..Default::default()
+        });
+        let descriptor = KexecPayloadDescriptorV2 {
+            common: KexecPayloadDescriptor {
+                version: KexecPayloadDescriptorV2::VERSION,
+                ..payload_descriptor()
+            },
+            sidecar_base: 0x103000,
+            sidecar_size: 4099,
+        };
+        for policy in [None, Some(&policy)] {
+            let region = build_measured_vtl2_config_region(
+                empty_config(),
+                policy,
+                Some(KexecPayload::V2(descriptor)),
+            )
+            .unwrap();
+            let legacy = build_measured_vtl2_config_region(empty_config(), policy, None).unwrap();
+            let (config, _) = ParavisorMeasuredVtl2Config::ref_from_prefix(&region).unwrap();
+            let offset =
+                kexec_payload_descriptor_offset_for_version(config.product_policy_size, 2).unwrap();
+            assert_eq!(&region[..offset], &legacy[..offset]);
+            let (decoded, tail) =
+                KexecPayloadDescriptorV2::ref_from_prefix(&region[offset..]).unwrap();
+            assert_eq!(decoded.as_bytes(), descriptor.as_bytes());
+            assert!(tail.iter().all(|&byte| byte == 0));
+        }
     }
 }

@@ -22,6 +22,8 @@ mod cmdline;
 mod dt;
 mod host_params;
 mod hypercall;
+#[cfg(all(target_arch = "x86_64", any(minimal_rt, test)))]
+mod kexec;
 mod memory;
 mod rt;
 mod sidecar;

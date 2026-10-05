@@ -201,7 +201,13 @@ The modules directory must contain the installed `kernel/drivers/...` tree,
 not just the kernel build directory's `drivers/...` files. The custom kernel
 resolver also expects `kernel_build_metadata.json` beside `vmlinux`.
 
-Add `--with-sidecar` to include the sidecar. Without `--release`, the output
+Add `--with-sidecar` to include the raw sidecar and boot-shim V3 payloads.
+Keep `OPENHCL_SIDECAR=off` for the current bootstrap-only transition test.
+Use the pre-existing ELF/DTB/VTL2 kexec kernel, without the custom bundle
+patches. First boot the updated image normally, then deliver that image
+through the kexec trigger. The running VM must have no active sidecar client. Omit this option
+for the existing direct-to-Linux, no-sidecar kexec path.
+Without `--release`, the output
 for this customized recipe is
 `flowey-out/artifacts/build-igvm/debug/x64-custom/openhcl-x64-custom.bin`.
 Use `--build-label x64-kexec-a` to select a different output label and
@@ -231,8 +237,30 @@ cargo nextest run --profile agent -p underhill_core --run-ignored only \
     -E 'test(servicing_igvm_artifact_matches_inputs)'
 ```
 
+For a sidecar image, also set `OPENHCL_TEST_SIDECAR=path/to/sidecar` to the
+raw sidecar artifact from that same build, not its debug-symbol file. The test
+requires this input when a sidecar payload is present and compares every
+extracted byte. For V3, also set
+`OPENHCL_TEST_BOOTSTRAP=path/to/openhcl_boot` to that build's raw boot shim.
+The artifact test also composes an ELF using the production staging code;
+set `OPENHCL_TEST_COMPOSITE_ELF=path/to/composite.elf` to export it for
+inspection with `readelf -lW`. Expect four 2 MiB-aligned outer load regions,
+even if the input sidecar or bootstrap has unaligned inner segments.
+See the [V3 payload contract](../../reference/architecture/openhcl/igvm.md#bootstrap-payload-v3)
+for the current handoff limitation.
+
+The former `OpenHCL bootstrap staged (sidecar disabled)` kernel message no
+longer applies: the kernel now loads an ordinary ELF without sidecar-specific
+handling. Verify the successor's command line includes
+`OPENHCL_KEXEC_SERVICING=1`, persisted-state restore completes, a servicing
+blackout event appears, and VTL0 uptime/workload continues. A new Linux banner
+alone is insufficient; reloading UEFI into VTL0 indicates fresh initialization.
+Do not enable sidecar yet: active CPU handoff remains gated. Rebuild old V3
+bootstrap artifacts if staging reports a missing composite-entry note.
+
 This test checks exact extracted bytes, but does not validate the host
-delivery path or execute the transition. For end-to-end validation:
+delivery path or execute the transition. For end-to-end validation of the
+currently supported no-sidecar kexec path:
 
 1. Inspect each built IGVM's `KexecPayloadDescriptor` and extract its kernel
     and initrd ranges using their exact byte lengths, excluding page padding.
@@ -251,9 +279,10 @@ delivery path or execute the transition. For end-to-end validation:
     match B, rather than relying only on a successful notification or the
     image's filename. Verify VTL0 remains alive and its workload continues.
 4. Repeat servicing cycles, checking completion and VTL0 liveness each time.
-    Exercise sidecar-enabled images and active VTL0 network and storage I/O;
-    check that connections and storage operations recover and continue
-    without data corruption.
+    Exercise active VTL0 network and storage I/O; check that connections and
+    storage operations recover and continue without data corruption. Fresh
+    sidecar kexec transitions require the remaining kernel and boot handoff
+    implementation; an artifact-test pass does not establish that support.
 
 ### Advanced
 

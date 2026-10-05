@@ -700,7 +700,7 @@ impl LoadedVm {
             return Ok(());
         }
 
-        let staged = kexec_prepare::prepare_kexec(&igvm_data);
+        let staged = kexec_prepare::prepare_kexec(&igvm_data, self.partition.sidecar_enabled());
         drop(igvm_data);
         let online_cpus = match staged {
             Ok(online_cpus) => online_cpus,

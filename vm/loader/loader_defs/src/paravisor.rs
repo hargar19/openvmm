@@ -476,7 +476,8 @@ pub const PRODUCT_POLICY_MAX_SIZE_BYTES: usize =
 pub struct KexecPayloadDescriptor {
     /// Magic value. Must be [`Self::MAGIC`].
     pub magic: u64,
-    /// Layout version. Must be [`Self::VERSION`].
+    /// Layout version. [`Self::VERSION`] for this layout, or
+    /// [`KexecPayloadDescriptorV2::VERSION`] when followed by sidecar fields.
     pub version: u32,
     /// Reserved; must be zero.
     pub reserved: u32,
@@ -493,17 +494,72 @@ pub struct KexecPayloadDescriptor {
 impl KexecPayloadDescriptor {
     /// Magic value with little-endian bytes `OHCLKEX1`.
     pub const MAGIC: u64 = u64::from_le_bytes(*b"OHCLKEX1");
-    /// Current descriptor layout version.
+    /// Original descriptor layout version.
     pub const VERSION: u32 = 1;
 }
 
+/// Kexec payload descriptor with an optional raw sidecar ELF from the same build.
+///
+/// The common prefix retains the V1 magic and field offsets. Both sidecar fields
+/// must be zero when absent. A present payload uses the exact file size and its
+/// pre-relocation IGVM GPA, not the running sidecar's memory range.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct KexecPayloadDescriptorV2 {
+    /// Common descriptor fields, with version set to [`Self::VERSION`].
+    pub common: KexecPayloadDescriptor,
+    /// Guest physical base address of the raw sidecar ELF, or zero.
+    pub sidecar_base: u64,
+    /// Exact sidecar ELF file size in bytes, or zero.
+    pub sidecar_size: u64,
+}
+
+impl KexecPayloadDescriptorV2 {
+    /// Descriptor layout version with a raw sidecar payload.
+    pub const VERSION: u32 = 2;
+}
+
+/// Kexec components including the boot shim implementing the kexec entry ABI.
+#[repr(C)]
+#[derive(Copy, Clone, Debug, IntoBytes, Immutable, KnownLayout, FromBytes)]
+pub struct KexecPayloadDescriptorV3 {
+    /// V2 prefix with its common version set to [`Self::VERSION`].
+    pub common: KexecPayloadDescriptorV2,
+    /// Pre-relocation GPA of the exact raw boot-shim ELF file.
+    pub bootstrap_base: u64,
+    /// Exact raw boot-shim file size. Sidecar and bootstrap must both be present.
+    pub bootstrap_size: u64,
+}
+
+impl KexecPayloadDescriptorV3 {
+    /// Descriptor version carrying a kexec boot shim.
+    pub const VERSION: u32 = 3;
+}
+
 /// Returns the eight-byte-aligned offset after the product policy, provided the
-/// entire descriptor fits in the measured VTL2 config region.
+/// entire V1 descriptor fits in the measured VTL2 config region.
 pub fn kexec_payload_descriptor_offset(product_policy_size: u32) -> Option<usize> {
+    kexec_payload_descriptor_offset_for_version(
+        product_policy_size,
+        KexecPayloadDescriptor::VERSION,
+    )
+}
+
+/// Returns the descriptor offset if its supported version fits after the policy.
+pub fn kexec_payload_descriptor_offset_for_version(
+    product_policy_size: u32,
+    version: u32,
+) -> Option<usize> {
+    let descriptor_size = match version {
+        KexecPayloadDescriptor::VERSION => size_of::<KexecPayloadDescriptor>(),
+        KexecPayloadDescriptorV2::VERSION => size_of::<KexecPayloadDescriptorV2>(),
+        KexecPayloadDescriptorV3::VERSION => size_of::<KexecPayloadDescriptorV3>(),
+        _ => return None,
+    };
     let policy_end =
         PRODUCT_POLICY_INLINE_OFFSET.checked_add(usize::try_from(product_policy_size).ok()?)?;
     let offset = policy_end.checked_add(7)? & !7;
-    let end = offset.checked_add(size_of::<KexecPayloadDescriptor>())?;
+    let end = offset.checked_add(descriptor_size)?;
     let region_size =
         (PARAVISOR_MEASURED_VTL2_CONFIG_SIZE_PAGES as usize).checked_mul(HV_PAGE_SIZE as usize)?;
     (end <= region_size).then_some(offset)
@@ -609,5 +665,91 @@ mod tests {
         assert_eq!(kexec_payload_descriptor_offset(4025), None);
         assert_eq!(kexec_payload_descriptor_offset(4072), None);
         assert_eq!(kexec_payload_descriptor_offset(u32::MAX), None);
+    }
+
+    #[test]
+    fn kexec_payload_descriptor_v2_layout() {
+        assert_eq!(size_of::<KexecPayloadDescriptorV2>(), 64);
+        assert_eq!(align_of::<KexecPayloadDescriptorV2>(), 8);
+        assert_eq!(core::mem::offset_of!(KexecPayloadDescriptorV2, common), 0);
+        assert_eq!(
+            core::mem::offset_of!(KexecPayloadDescriptorV2, sidecar_base),
+            48
+        );
+        assert_eq!(
+            core::mem::offset_of!(KexecPayloadDescriptorV2, sidecar_size),
+            56
+        );
+        let descriptor = KexecPayloadDescriptorV2 {
+            common: KexecPayloadDescriptor {
+                magic: KexecPayloadDescriptor::MAGIC,
+                version: KexecPayloadDescriptorV2::VERSION,
+                reserved: 0,
+                initrd_base: 0x1000,
+                initrd_size: 23,
+                custom_binary_base: 0x2000,
+                custom_binary_size: 47,
+            },
+            sidecar_base: 0x3000,
+            sidecar_size: 61,
+        };
+        let (common, remaining) =
+            KexecPayloadDescriptor::read_from_prefix(descriptor.as_bytes()).unwrap();
+        assert_eq!(common.as_bytes(), descriptor.common.as_bytes());
+        assert_eq!(remaining.len(), 16);
+        let decoded = KexecPayloadDescriptorV2::read_from_bytes(descriptor.as_bytes()).unwrap();
+        assert_eq!(decoded.sidecar_base, 0x3000);
+        assert_eq!(decoded.sidecar_size, 61);
+    }
+
+    #[test]
+    fn kexec_payload_descriptor_versioned_offset_bounds() {
+        for version in [
+            KexecPayloadDescriptor::VERSION,
+            KexecPayloadDescriptorV2::VERSION,
+        ] {
+            assert_eq!(
+                kexec_payload_descriptor_offset_for_version(0, version),
+                Some(24)
+            );
+            assert_eq!(
+                kexec_payload_descriptor_offset_for_version(1, version),
+                Some(32)
+            );
+            assert_eq!(
+                kexec_payload_descriptor_offset_for_version(u32::MAX, version),
+                None
+            );
+        }
+        assert_eq!(
+            kexec_payload_descriptor_offset_for_version(4008, 2),
+            Some(4032)
+        );
+        assert_eq!(kexec_payload_descriptor_offset_for_version(4009, 2), None);
+        assert_eq!(
+            kexec_payload_descriptor_offset_for_version(4024, 1),
+            Some(4048)
+        );
+        assert_eq!(kexec_payload_descriptor_offset_for_version(0, 0), None);
+        assert_eq!(kexec_payload_descriptor_offset_for_version(0, 4), None);
+    }
+
+    #[test]
+    fn kexec_payload_descriptor_v3_layout() {
+        assert_eq!(size_of::<KexecPayloadDescriptorV3>(), 80);
+        assert_eq!(
+            core::mem::offset_of!(KexecPayloadDescriptorV3, bootstrap_base),
+            64
+        );
+        assert_eq!(
+            core::mem::offset_of!(KexecPayloadDescriptorV3, bootstrap_size),
+            72
+        );
+        assert_eq!(kexec_payload_descriptor_offset_for_version(0, 3), Some(24));
+        assert_eq!(
+            kexec_payload_descriptor_offset_for_version(3992, 3),
+            Some(4016)
+        );
+        assert_eq!(kexec_payload_descriptor_offset_for_version(3993, 3), None);
     }
 }

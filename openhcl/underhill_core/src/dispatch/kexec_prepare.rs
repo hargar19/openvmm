@@ -1,7 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT License.
 
-//! Extract and stage the matching kernel and initrd from a servicing IGVM.
+//! Extract matching kexec components from a servicing IGVM and stage supported payloads.
+
+mod composite;
 
 use anyhow::Context;
 use guest_emulation_transport::api::MAX_SERVICING_IGVM_SIZE;
@@ -25,9 +27,12 @@ use igvm_defs::IgvmVariableHeaderType;
 use igvm_defs::VbsVpContextHeader;
 use igvm_defs::VbsVpContextRegister;
 use loader_defs::paravisor::KexecPayloadDescriptor;
+use loader_defs::paravisor::KexecPayloadDescriptorV2;
+use loader_defs::paravisor::KexecPayloadDescriptorV3;
 use loader_defs::paravisor::PARAVISOR_MEASURED_VTL2_CONFIG_SIZE_PAGES;
 use loader_defs::paravisor::ParavisorMeasuredVtl2Config;
 use loader_defs::paravisor::kexec_payload_descriptor_offset;
+use loader_defs::paravisor::kexec_payload_descriptor_offset_for_version;
 use object::LittleEndian;
 use object::read::elf::FileHeader;
 use std::collections::TryReserveError;
@@ -71,22 +76,34 @@ enum ExtractError {
     InvalidConfig,
     #[error("missing or unsupported kexec payload descriptor")]
     InvalidDescriptor,
-    #[error("kernel, initrd, and measured config ranges overlap")]
+    #[error("kexec payload and measured config ranges overlap")]
     OverlappingPayloads,
-    #[error("invalid ELF kernel")]
+    #[error("invalid ELF payload")]
     Elf(#[from] object::Error),
     #[error("kernel is not a supported little-endian x64 executable ELF with valid load segments")]
     InvalidKernel,
+    #[error(
+        "sidecar or bootstrap is not a supported little-endian x64 ELF with a file-backed executable entry point"
+    )]
+    InvalidSidecar,
 }
 
-pub(super) fn prepare_kexec(igvm_data: &[u8]) -> anyhow::Result<String> {
+pub(super) fn prepare_kexec(igvm_data: &[u8], sidecar_running: bool) -> anyhow::Result<String> {
     let payload = extract_payload(igvm_data).context("failed to extract servicing IGVM")?;
+    anyhow::ensure!(
+        payload.sidecar.is_none() || payload.bootstrap.is_some(),
+        "incoming IGVM requires a fresh sidecar; missing kexec bootstrap (requires descriptor V3)"
+    );
+    anyhow::ensure!(
+        payload.bootstrap.is_none() || !sidecar_running,
+        "composite bootstrap cannot retire an active sidecar yet"
+    );
     let raw_cmdline = std::fs::read_to_string("/proc/cmdline")
         .context("failed to read current kernel command line")?;
     let cmdline = build_kexec_cmdline(&raw_cmdline)?;
     let online_cpus = online_cpu_mask()?;
-    let kernel = stage_file(&payload.kernel, "openhcl-kexec-kernel")
-        .context("failed to stage servicing kernel")?;
+    let kernel =
+        stage_kernel(&payload, &raw_cmdline).context("failed to stage servicing kernel")?;
     let initrd = stage_file(&payload.initrd, "openhcl-kexec-initrd")
         .context("failed to stage servicing initrd")?;
     drop(payload);
@@ -127,6 +144,29 @@ fn stage_file(data: &[u8], name: &str) -> anyhow::Result<File> {
     file.write_all_at(data, 0)
         .context("failed to write kexec memfd")?;
     Ok(file)
+}
+
+fn stage_kernel(payload: &Payload, cmdline: &str) -> anyhow::Result<File> {
+    let Some(bootstrap) = &payload.bootstrap else {
+        anyhow::ensure!(
+            payload.sidecar.is_none(),
+            "sidecar requires a kexec bootstrap"
+        );
+        return stage_file(&payload.kernel, "openhcl-kexec-kernel");
+    };
+    anyhow::ensure!(
+        cmdline
+            .split_whitespace()
+            .filter_map(|word| word.strip_prefix("OPENHCL_SIDECAR="))
+            .next_back()
+            == Some("off"),
+        "kexec bootstrap currently requires OPENHCL_SIDECAR=off; fresh sidecar CPU/memory handoff is not yet supported"
+    );
+    let sidecar = payload
+        .sidecar
+        .as_ref()
+        .context("bootstrap requires a sidecar payload")?;
+    composite::stage(&payload.kernel, sidecar, bootstrap)
 }
 
 fn read_header<T: FromBytes + Immutable + KnownLayout>(data: &[u8]) -> Result<T, ExtractError> {
@@ -312,6 +352,8 @@ struct Page<'a> {
 struct Payload {
     kernel: Vec<u8>,
     initrd: Vec<u8>,
+    sidecar: Option<Vec<u8>>,
+    bootstrap: Option<Vec<u8>>,
 }
 
 fn payload_range(base: u64, size: u64) -> Result<Range<u64>, ExtractError> {
@@ -415,26 +457,66 @@ fn extract_payload(data: &[u8]) -> Result<Payload, ExtractError> {
         }
         let offset = kexec_payload_descriptor_offset(header.product_policy_size)
             .ok_or(ExtractError::InvalidConfig)?;
-        config = Some((payload_range(page.gpa, CONFIG_SIZE)?, offset));
+        config = Some((
+            payload_range(page.gpa, CONFIG_SIZE)?,
+            offset,
+            header.product_policy_size,
+        ));
     }
-    let (config_range, descriptor_offset) = config.ok_or(ExtractError::ConfigCount)?;
+    let (config_range, descriptor_offset, policy_size) = config.ok_or(ExtractError::ConfigCount)?;
     let config_bytes = copy_range(&pages, &config_range)?;
     let descriptor_data = config_bytes
         .get(descriptor_offset..)
         .ok_or(ExtractError::InvalidDescriptor)?;
     let (descriptor, _) = KexecPayloadDescriptor::read_from_prefix(descriptor_data)
         .map_err(|_| ExtractError::InvalidDescriptor)?;
-    if descriptor.magic != KexecPayloadDescriptor::MAGIC
-        || descriptor.version != KexecPayloadDescriptor::VERSION
-        || descriptor.reserved != 0
-    {
+    if descriptor.magic != KexecPayloadDescriptor::MAGIC || descriptor.reserved != 0 {
         return Err(ExtractError::InvalidDescriptor);
     }
+    kexec_payload_descriptor_offset_for_version(policy_size, descriptor.version)
+        .ok_or(ExtractError::InvalidDescriptor)?;
+    let sidecar_range = match descriptor.version {
+        KexecPayloadDescriptor::VERSION => None,
+        KexecPayloadDescriptorV2::VERSION | KexecPayloadDescriptorV3::VERSION => {
+            let (descriptor, _) = KexecPayloadDescriptorV2::read_from_prefix(descriptor_data)
+                .map_err(|_| ExtractError::InvalidDescriptor)?;
+            match (descriptor.sidecar_base, descriptor.sidecar_size) {
+                (0, 0) => None,
+                (0, _) | (_, 0) => return Err(ExtractError::InvalidDescriptor),
+                (base, size) => Some(payload_range(base, size)?),
+            }
+        }
+        _ => return Err(ExtractError::InvalidDescriptor),
+    };
+    let bootstrap_range = if descriptor.version == KexecPayloadDescriptorV3::VERSION {
+        let (descriptor, _) = KexecPayloadDescriptorV3::read_from_prefix(descriptor_data)
+            .map_err(|_| ExtractError::InvalidDescriptor)?;
+        if sidecar_range.is_none() || descriptor.bootstrap_base == 0 {
+            return Err(ExtractError::InvalidDescriptor);
+        }
+        Some(payload_range(
+            descriptor.bootstrap_base,
+            descriptor.bootstrap_size,
+        )?)
+    } else {
+        None
+    };
     let kernel_range = payload_range(descriptor.custom_binary_base, descriptor.custom_binary_size)?;
     let initrd_range = payload_range(descriptor.initrd_base, descriptor.initrd_size)?;
     if overlaps(&kernel_range, &initrd_range)
         || overlaps(&kernel_range, &config_range)
         || overlaps(&initrd_range, &config_range)
+        || sidecar_range.as_ref().is_some_and(|sidecar| {
+            [&kernel_range, &initrd_range, &config_range]
+                .iter()
+                .any(|range| overlaps(sidecar, range))
+        })
+        || bootstrap_range.as_ref().is_some_and(|bootstrap| {
+            [&kernel_range, &initrd_range, &config_range]
+                .into_iter()
+                .chain(sidecar_range.as_ref())
+                .any(|range| overlaps(bootstrap, range))
+        })
     {
         return Err(ExtractError::OverlappingPayloads);
     }
@@ -447,10 +529,91 @@ fn extract_payload(data: &[u8]) -> Result<Payload, ExtractError> {
         &mut total,
         usize::try_from(descriptor.initrd_size).map_err(|_| ExtractError::TooLarge)?,
     )?;
+    for range in sidecar_range.iter().chain(bootstrap_range.iter()) {
+        account_expansion(
+            &mut total,
+            usize::try_from(range.end - range.start).map_err(|_| ExtractError::TooLarge)?,
+        )?;
+    }
     let kernel = copy_range(&pages, &kernel_range)?;
     validate_kernel(&kernel)?;
     let initrd = copy_range(&pages, &initrd_range)?;
-    Ok(Payload { kernel, initrd })
+    let sidecar = sidecar_range
+        .map(|range| {
+            let bytes = copy_range(&pages, &range)?;
+            validate_sidecar(&bytes)?;
+            Ok::<_, ExtractError>(bytes)
+        })
+        .transpose()?;
+    let bootstrap = bootstrap_range
+        .map(|range| {
+            let bytes = copy_range(&pages, &range)?;
+            validate_sidecar(&bytes)?;
+            Ok::<_, ExtractError>(bytes)
+        })
+        .transpose()?;
+    Ok(Payload {
+        kernel,
+        initrd,
+        sidecar,
+        bootstrap,
+    })
+}
+
+fn validate_sidecar(data: &[u8]) -> Result<(), ExtractError> {
+    let header = object::elf::FileHeader64::<LittleEndian>::parse(data)?;
+    if !header.is_supported()
+        || !header.is_little_endian()
+        || !matches!(
+            header.e_type.get(LittleEndian),
+            object::elf::ET_EXEC | object::elf::ET_DYN
+        )
+        || header.e_machine.get(LittleEndian) != object::elf::EM_X86_64
+    {
+        return Err(ExtractError::InvalidSidecar);
+    }
+    let entry = header.e_entry.get(LittleEndian);
+    let mut executable_entry = false;
+    let mut expanded = 0;
+    for program in header.program_headers(LittleEndian, data)? {
+        if program.p_type.get(LittleEndian) != object::elf::PT_LOAD {
+            continue;
+        }
+        let file_size = program.p_filesz.get(LittleEndian);
+        let memory_size = program.p_memsz.get(LittleEndian);
+        let virtual_address = program.p_vaddr.get(LittleEndian);
+        let alignment = program.p_align.get(LittleEndian);
+        if memory_size < file_size
+            || program
+                .p_offset
+                .get(LittleEndian)
+                .checked_add(file_size)
+                .is_none_or(|end| end > data.len() as u64)
+            || program
+                .p_paddr
+                .get(LittleEndian)
+                .checked_add(memory_size)
+                .is_none()
+            || virtual_address.checked_add(memory_size).is_none()
+            || (alignment > 1
+                && (!alignment.is_power_of_two()
+                    || virtual_address % alignment
+                        != program.p_offset.get(LittleEndian) % alignment))
+        {
+            return Err(ExtractError::InvalidSidecar);
+        }
+        account_expansion(
+            &mut expanded,
+            usize::try_from(memory_size).map_err(|_| ExtractError::TooLarge)?,
+        )?;
+        executable_entry |= program.p_flags.get(LittleEndian) & object::elf::PF_X != 0
+            && entry >= virtual_address
+            && entry - virtual_address < file_size;
+    }
+    if !executable_entry {
+        return Err(ExtractError::InvalidSidecar);
+    }
+    Ok(())
 }
 
 fn validate_kernel(data: &[u8]) -> Result<(), ExtractError> {
@@ -512,6 +675,7 @@ mod tests {
     const CONFIG_GPA: u64 = 0x10000;
     const KERNEL_GPA: u64 = 0x20000;
     const INITRD_GPA: u64 = 0x30000;
+    const SIDECAR_GPA: u64 = 0x40000;
 
     #[test]
     #[ignore = "requires OPENHCL_TEST_SERVICING_IGVM, OPENHCL_TEST_VMLINUX and OPENHCL_TEST_INITRD artifacts"]
@@ -525,6 +689,60 @@ mod tests {
             extract_payload(&image).expect("generated IGVM must be accepted for servicing");
         assert_eq!(payload.kernel, read_artifact("OPENHCL_TEST_VMLINUX"));
         assert_eq!(payload.initrd, read_artifact("OPENHCL_TEST_INITRD"));
+        match std::env::var_os("OPENHCL_TEST_SIDECAR") {
+            Some(path) => assert_eq!(
+                payload.sidecar.as_deref(),
+                Some(
+                    std::fs::read(path)
+                        .expect("sidecar artifact must be readable")
+                        .as_slice()
+                )
+            ),
+            None => assert!(
+                payload.sidecar.is_none(),
+                "set OPENHCL_TEST_SIDECAR for a sidecar payload"
+            ),
+        }
+        match std::env::var_os("OPENHCL_TEST_BOOTSTRAP") {
+            Some(path) => assert_eq!(
+                payload.bootstrap.as_deref(),
+                Some(
+                    std::fs::read(path)
+                        .expect("bootstrap artifact must be readable")
+                        .as_slice()
+                )
+            ),
+            None => assert!(
+                payload.bootstrap.is_none(),
+                "set OPENHCL_TEST_BOOTSTRAP for a bootstrap payload"
+            ),
+        }
+        if payload.bootstrap.is_some() {
+            let mut composite = stage_kernel(&payload, "OPENHCL_SIDECAR=off")
+                .expect("generated components must produce a loader-compatible ELF");
+            let mut bytes = Vec::new();
+            composite.read_to_end(&mut bytes).unwrap();
+            let header =
+                object::elf::FileHeader64::<LittleEndian>::parse(bytes.as_slice()).unwrap();
+            assert_eq!(header.e_type.get(LittleEndian), object::elf::ET_EXEC);
+            assert_eq!(header.e_phnum.get(LittleEndian), 4);
+            for program in header
+                .program_headers(LittleEndian, bytes.as_slice())
+                .unwrap()
+            {
+                assert_eq!(
+                    program.p_paddr.get(LittleEndian) % loader_defs::kexec::COMPOSITE_ALIGNMENT,
+                    0
+                );
+                assert_eq!(
+                    program.p_align.get(LittleEndian),
+                    loader_defs::kexec::COMPOSITE_ALIGNMENT
+                );
+            }
+            if let Some(path) = std::env::var_os("OPENHCL_TEST_COMPOSITE_ELF") {
+                std::fs::write(path, &bytes).expect("composite artifact must be writable");
+            }
+        }
     }
 
     struct Fixture {
@@ -534,9 +752,15 @@ mod tests {
         descriptor: KexecPayloadDescriptor,
         kernel: Vec<u8>,
         initrd: Vec<u8>,
+        sidecar: Vec<u8>,
+        sidecar_base: u64,
+        sidecar_size: u64,
+        bootstrap: Vec<u8>,
+        bootstrap_base: u64,
+        bootstrap_size: u64,
     }
 
-    fn kernel_fixture() -> Vec<u8> {
+    pub(super) fn kernel_fixture() -> Vec<u8> {
         let mut kernel = vec![0x37; PAGE_SIZE + 123];
         let header = object::elf::FileHeader64 {
             e_ident: object::elf::Ident {
@@ -605,7 +829,22 @@ mod tests {
                 },
                 kernel,
                 initrd,
+                sidecar: Vec::new(),
+                sidecar_base: 0,
+                sidecar_size: 0,
+                bootstrap: Vec::new(),
+                bootstrap_base: 0,
+                bootstrap_size: 0,
             }
+        }
+
+        fn with_sidecar(mut self) -> Self {
+            self.descriptor.version = KexecPayloadDescriptorV2::VERSION;
+            self.sidecar = kernel_fixture();
+            self.sidecar[16..18].copy_from_slice(&object::elf::ET_DYN.to_le_bytes());
+            self.sidecar_base = SIDECAR_GPA;
+            self.sidecar_size = self.sidecar.len() as u64;
+            self
         }
 
         fn directives(&self) -> Vec<IgvmDirectiveHeader> {
@@ -624,11 +863,34 @@ mod tests {
             let offset = kexec_payload_descriptor_offset(self.policy_size).unwrap();
             config_bytes[offset..offset + size_of::<KexecPayloadDescriptor>()]
                 .copy_from_slice(self.descriptor.as_bytes());
+            if matches!(
+                self.descriptor.version,
+                KexecPayloadDescriptorV2::VERSION | KexecPayloadDescriptorV3::VERSION
+            ) {
+                let descriptor = KexecPayloadDescriptorV2 {
+                    common: self.descriptor,
+                    sidecar_base: self.sidecar_base,
+                    sidecar_size: self.sidecar_size,
+                };
+                config_bytes[offset..offset + size_of::<KexecPayloadDescriptorV2>()]
+                    .copy_from_slice(descriptor.as_bytes());
+                if self.descriptor.version == KexecPayloadDescriptorV3::VERSION {
+                    let descriptor = KexecPayloadDescriptorV3 {
+                        common: descriptor,
+                        bootstrap_base: self.bootstrap_base,
+                        bootstrap_size: self.bootstrap_size,
+                    };
+                    config_bytes[offset..offset + size_of::<KexecPayloadDescriptorV3>()]
+                        .copy_from_slice(descriptor.as_bytes());
+                }
+            }
             let mut directives = Vec::new();
             for (base, bytes) in [
                 (CONFIG_GPA, config_bytes.as_slice()),
                 (KERNEL_GPA, self.kernel.as_slice()),
                 (INITRD_GPA, self.initrd.as_slice()),
+                (SIDECAR_GPA, self.sidecar.as_slice()),
+                (0x50000, self.bootstrap.as_slice()),
             ] {
                 for (index, chunk) in bytes.chunks(PAGE_SIZE).enumerate() {
                     directives.push(IgvmDirectiveHeader::PageData {
@@ -707,6 +969,174 @@ mod tests {
         assert_eq!(payload.initrd, fixture.initrd);
         assert_eq!(payload.kernel.len(), PAGE_SIZE + 123);
         assert_eq!(payload.initrd.len(), PAGE_SIZE + 17);
+        assert!(payload.sidecar.is_none());
+    }
+
+    #[test]
+    fn extracts_v2_sidecar_exact_bytes() {
+        for policy_size in [0, 9, 4008] {
+            let fixture = Fixture::new(policy_size).with_sidecar();
+            let payload = extract_payload(&fixture.image()).unwrap();
+            assert_eq!(payload.kernel, fixture.kernel);
+            assert_eq!(payload.initrd, fixture.initrd);
+            assert_eq!(payload.sidecar.as_deref(), Some(fixture.sidecar.as_slice()));
+        }
+    }
+
+    #[test]
+    fn extracts_v2_without_sidecar() {
+        let mut fixture = Fixture::new(0);
+        fixture.descriptor.version = KexecPayloadDescriptorV2::VERSION;
+        assert!(extract_payload(&fixture.image()).unwrap().sidecar.is_none());
+    }
+
+    #[test]
+    fn extracts_v3_bootstrap_and_checks_staging_requirements() {
+        let mut fixture = Fixture::new(0).with_sidecar();
+        fixture.descriptor.version = KexecPayloadDescriptorV3::VERSION;
+        fixture.bootstrap = kernel_fixture();
+        fixture.bootstrap_base = 0x50000;
+        fixture.bootstrap_size = fixture.bootstrap.len() as u64;
+        let payload = extract_payload(&fixture.image()).unwrap();
+        assert_eq!(
+            payload.bootstrap.as_deref(),
+            Some(fixture.bootstrap.as_slice())
+        );
+        for cmdline in [
+            "",
+            "OPENHCL_SIDECAR=on",
+            "OPENHCL_SIDECAR=log",
+            "OPENHCL_SIDECAR=off OPENHCL_SIDECAR=on",
+        ] {
+            assert!(stage_kernel(&payload, cmdline).is_err());
+        }
+        assert!(stage_kernel(&payload, "OPENHCL_SIDECAR=off").is_err());
+        assert!(
+            prepare_kexec(&fixture.image(), true)
+                .unwrap_err()
+                .to_string()
+                .contains("active sidecar")
+        );
+        fixture.bootstrap_base = fixture.sidecar_base;
+        assert!(matches!(
+            extract_payload(&fixture.image()),
+            Err(ExtractError::OverlappingPayloads)
+        ));
+        fixture.bootstrap_base = 0;
+        assert!(matches!(
+            extract_payload(&fixture.image()),
+            Err(ExtractError::InvalidDescriptor)
+        ));
+    }
+
+    #[test]
+    fn sidecar_handoff_is_rejected_before_staging() {
+        let fixture = Fixture::new(0).with_sidecar();
+        let error = prepare_kexec(&fixture.image(), false).unwrap_err();
+        assert!(error.to_string().contains("missing kexec bootstrap"));
+    }
+
+    #[test]
+    fn invalid_sidecar_ranges_are_rejected() {
+        for variant in 0..9 {
+            let mut fixture = Fixture::new(0).with_sidecar();
+            match variant {
+                0 => fixture.sidecar_base = 0,
+                1 => fixture.sidecar_size = 0,
+                2 => fixture.sidecar_base = CONFIG_GPA,
+                3 => fixture.sidecar_base = KERNEL_GPA,
+                4 => fixture.sidecar_base = INITRD_GPA,
+                5 => fixture.sidecar_base += 1,
+                6 => fixture.sidecar_base = u64::MAX - PAGE_SIZE as u64 + 1,
+                7 => fixture.sidecar_size = MAX_SERVICING_IGVM_SIZE as u64 + 1,
+                _ => {
+                    fixture.sidecar_base = 0x40000000;
+                    fixture.sidecar_size = MAX_SERVICING_IGVM_SIZE as u64;
+                }
+            }
+            assert!(
+                matches!(
+                    extract_payload(&fixture.image()),
+                    Err(ExtractError::InvalidDescriptor
+                        | ExtractError::OverlappingPayloads
+                        | ExtractError::InvalidRange
+                        | ExtractError::TooLarge)
+                ),
+                "variant {variant}"
+            );
+        }
+    }
+
+    #[test]
+    fn sidecar_pages_must_be_present_private_and_measured() {
+        let fixture = Fixture::new(0).with_sidecar();
+        for flags in [
+            IgvmPageDataFlags::new().with_unmeasured(true),
+            IgvmPageDataFlags::new().with_shared(true),
+        ] {
+            let mut directives = fixture.directives();
+            if let IgvmDirectiveHeader::PageData {
+                flags: page_flags, ..
+            } = page_mut(&mut directives, SIDECAR_GPA)
+            {
+                *page_flags = flags;
+            }
+            assert!(matches!(
+                extract_payload(&fixture.serialize(directives)),
+                Err(ExtractError::InvalidPage(SIDECAR_GPA))
+            ));
+        }
+        let mut directives = fixture.directives();
+        directives.retain(|directive| {
+            !matches!(directive,
+            IgvmDirectiveHeader::PageData { gpa, .. } if *gpa == SIDECAR_GPA + PAGE_SIZE as u64)
+        });
+        assert!(matches!(
+            extract_payload(&fixture.serialize(directives)),
+            Err(ExtractError::MissingPage(_))
+        ));
+    }
+
+    #[test]
+    fn sidecar_requires_valid_elf_and_executable_entry() {
+        for variant in 0..10 {
+            let mut fixture = Fixture::new(0).with_sidecar();
+            match variant {
+                0 => fixture.sidecar[0] = 0,
+                1 => fixture.sidecar[5] = object::elf::ELFDATA2MSB,
+                2 => fixture.sidecar[16..18].copy_from_slice(&object::elf::ET_REL.to_le_bytes()),
+                3 => {
+                    fixture.sidecar[18..20].copy_from_slice(&object::elf::EM_AARCH64.to_le_bytes())
+                }
+                4 => fixture.sidecar[24..32].copy_from_slice(&0u64.to_le_bytes()),
+                5 => fixture.sidecar[68..72].copy_from_slice(&object::elf::PF_R.to_le_bytes()),
+                6 => fixture.sidecar[72..80].copy_from_slice(&u64::MAX.to_le_bytes()),
+                7 => fixture.sidecar[104..112].copy_from_slice(&1u64.to_le_bytes()),
+                8 => fixture.sidecar[112..120].copy_from_slice(&3u64.to_le_bytes()),
+                _ => fixture.sidecar[24..32]
+                    .copy_from_slice(&(0x100000 + fixture.sidecar_size).to_le_bytes()),
+            }
+            assert!(
+                extract_payload(&fixture.image()).is_err(),
+                "variant {variant}"
+            );
+        }
+    }
+
+    #[test]
+    fn v2_descriptor_must_fit_entirely_in_config() {
+        let fixture = Fixture::new(4024);
+        let mut directives = fixture.directives();
+        if let IgvmDirectiveHeader::PageData { data, .. } = page_mut(&mut directives, CONFIG_GPA) {
+            let offset = kexec_payload_descriptor_offset(fixture.policy_size).unwrap();
+            mutate_header::<KexecPayloadDescriptor>(data, offset, |descriptor| {
+                descriptor.version = KexecPayloadDescriptorV2::VERSION;
+            });
+        }
+        assert!(matches!(
+            extract_payload(&fixture.serialize(directives)),
+            Err(ExtractError::InvalidDescriptor)
+        ));
     }
 
     #[test]
@@ -868,7 +1298,7 @@ mod tests {
             let mut fixture = Fixture::new(9);
             match variant {
                 0 => fixture.descriptor.magic = 0,
-                1 => fixture.descriptor.version += 1,
+                1 => fixture.descriptor.version = KexecPayloadDescriptorV3::VERSION + 1,
                 _ => fixture.descriptor.reserved = 1,
             }
             assert!(matches!(

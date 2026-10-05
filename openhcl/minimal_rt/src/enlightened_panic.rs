@@ -73,6 +73,23 @@ pub fn report(
     );
 }
 
+/// Reports a pre-OS failure without constructing or raising a Rust panic.
+///
+/// Messages are included only after [`enable_enlightened_panic`] is called.
+/// `message_va_to_pa` must translate the message's address to its physical address.
+pub fn report_message(
+    tag: [u8; 8],
+    message: &str,
+    mut message_va_to_pa: impl FnMut(*const ()) -> Option<usize>,
+) {
+    let message = if CAN_REPORT_MSG.load(Relaxed) {
+        message.as_bytes()
+    } else {
+        &[]
+    };
+    report_raw(tag, message, message_va_to_pa(message.as_ptr().cast()));
+}
+
 /// Enables writing the enlightened panic message.
 ///
 /// If this is not called, then [`report`] will just report that a panic occurred

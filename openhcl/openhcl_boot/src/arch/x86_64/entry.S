@@ -33,3 +33,18 @@ _start:
     pop     rdi                                     // restore rdi (arg 0) to call start
     mov     rsi, [rsp]                              // restore rsi (arg 1) to call start (leave on stack to align)
     jmp     {start}                                 // jump to start
+
+.globl openhcl_composite_entry
+openhcl_composite_entry:
+    mov     rdi, {COMPOSITE_ENTRY_MAGIC}
+    jmp     _start
+
+.pushsection .note.openhcl.kexec,"aR",@note
+.balign 4
+.long 8
+.long 16
+.long {COMPOSITE_NOTE_TYPE}
+.asciz "OPENHCL"
+.quad {COMPOSITE_ENTRY_MAGIC}
+.quad openhcl_composite_entry - .
+.popsection

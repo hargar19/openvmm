@@ -39,7 +39,14 @@ pub fn verify_stack_cookie() {
 /// The caller must ensure that the passed shim_params_offset is the correct offset
 /// from the shim base to the shim parameters.
 #[cfg_attr(not(minimal_rt), expect(dead_code))]
-pub unsafe extern "C" fn start(_: usize, shim_params_offset: isize) -> ! {
+pub unsafe extern "C" fn start(entry_kind: usize, shim_params_offset: isize) -> ! {
+    #[cfg(all(target_arch = "x86_64", minimal_rt))]
+    if entry_kind as u64 == loader_defs::kexec::COMPOSITE_ENTRY_MAGIC {
+        // SAFETY: the composite loader supplies mapped component allocations
+        // and Linux's existing boot-parameter argument in RSI.
+        unsafe { crate::kexec::start_composite(shim_params_offset as u64) }
+    }
+    let _ = entry_kind;
     crate::shim_main(shim_params_offset)
 }
 

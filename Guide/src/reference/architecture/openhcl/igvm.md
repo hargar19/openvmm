@@ -48,7 +48,7 @@ still begins at byte offset 24. The descriptor starts at
 `align8(24 + product_policy_size)`, relative to the start of that region,
 where `align8` rounds up to an eight-byte boundary.
 
-The descriptor is 48 bytes, with the following fields in order:
+The V1 descriptor is 48 bytes, with the following fields in order:
 
 | Field | Type | Meaning |
 | --- | --- | --- |
@@ -64,6 +64,78 @@ The descriptor must fit within the existing measured configuration region;
 the builder and parser reject a payload that would require extending that
 region. Neither the product policy nor the existing configuration header
 is moved to make room.
+
+#### Raw sidecar payload (V2)
+
+The earlier raw-sidecar format uses `KexecPayloadDescriptorV2`. Its 64-byte
+layout retains the V1 magic and common
+field offsets, sets `version` to `2`, and appends:
+
+| Field | Type | Meaning |
+| --- | --- | --- |
+| `sidecar_base` | `u64` | Raw sidecar ELF GPA before relocation, or `0`. |
+| `sidecar_size` | `u64` | Exact sidecar ELF file size, or `0`. |
+
+Both fields must be zero when sidecar is absent. The descriptor's complete
+version-specific length must fit after the product policy. Unknown versions
+are rejected. Images without a custom binary have no descriptor; images with
+a custom binary but no sidecar continue to use V1.
+
+The raw payload is copied from the same ELF used for normal sidecar loading.
+It is separate from the loaded sidecar segments and includes the original
+file bytes, excluding IGVM page padding. It does not depend on reading the
+running sidecar's reserved memory or adding sidecar to the root filesystem.
+The extractor checks private measured pages, bounds, nonoverlapping payload
+ranges, and a supported x64 ELF with a file-backed executable entry point.
+
+V2 remains readable for extraction tests, but a V2 sidecar payload cannot be
+staged: it lacks the incoming bootstrap required by V3.
+
+#### Bootstrap payload (V3)
+
+An x64 image with a custom binary and sidecar now emits
+`KexecPayloadDescriptorV3`. Its 80-byte layout retains the V2 prefix, sets
+the common `version` to `3`, and appends `bootstrap_base: u64` and
+`bootstrap_size: u64`. Both sidecar and bootstrap are required. The bootstrap
+is the raw `openhcl_boot` ELF from the same build. Its composite entry is
+advertised by a standard ELF note owned by `OPENHCL`, type `0x4f48434c`.
+The 16-byte descriptor contains `OHCLCE01` and a signed 64-bit displacement
+from the displacement field to that entry. Missing, duplicate, or invalid
+notes are rejected before stopping the VM. Older V3 bootstrap artifacts
+without this note must be rebuilt. Normal host boot is unchanged.
+
+OpenVMM constructs a standard x64 `ET_EXEC` ELF on the kernel memfd. Its four
+`PT_LOAD` regions contain metadata/scratch, bootstrap, sidecar, and Linux.
+Each region starts at a 2 MiB-aligned relative address. Input load segments
+retain their byte offsets within each component, including valid unaligned
+segments; BSS and gaps are zero-filled. The separate initrd fd is unchanged.
+All parsing, bounds checks, composition, and staging happen before VM stop.
+
+The existing ELF loader places this image at one relocated base and passes
+Linux's boot parameters through its existing `RSI` argument. The ELF entry
+points to the advertised bootstrap stub. The stub selects composite startup;
+after stack/BSS/relocation setup, the bootstrap locates its relative metadata
+one 2 MiB region before its own base. It constructs and validates the physical
+handoff itself and passes the original boot parameters to Linux.
+
+There is no kernel-recognized bundle header, companion loader, or special
+register ABI. The pre-existing raw-ELF, DTB, and VTL2 kexec support is still
+required; this does not imply compatibility with an unmodified upstream
+kernel. The old `OHCLKB01` bundle-specific kernel changes are no longer used.
+
+Runtime composition does not preserve a signature on the original Linux
+ELF. Kernel signature enforcement is not bypassed: deployments requiring
+signed kexec images must authenticate the complete composite through a
+trusted signing flow. Automatic composite signing is not implemented.
+
+```admonish warning
+The current test mode requires `OPENHCL_SIDECAR=off` and no active sidecar
+client in the running partition. It exercises kexec through the incoming bootstrap
+but does not start sidecar VPs. Fresh sidecar CPU assignment, predecessor
+retirement, and DT/E820 regeneration remain unimplemented and gated off.
+Both OpenHCL instances need the composite staging/entry implementation. The
+kernel requires only the pre-existing ELF/DTB/VTL2 kexec implementation.
+```
 
 ### Delivery and transition
 
@@ -83,7 +155,7 @@ sizes preserve exact payload bytes rather than including page padding.
 Servicing does not read a root filesystem `boot/vmlinux` or rebuild a CPIO
 archive from the running system.
 
-Before stopping the VM, OpenHCL writes the extracted kernel and initrd into
+Before stopping the VM, OpenHCL writes the direct or composite ELF and initrd into
 separate anonymous, RAM-backed memfds using `sparse_mmap::alloc_shared_memory`.
 Owned `File` handles keep both descriptors alive through
 `kexec_sys::kexec_file_load` and close them automatically afterward, including
