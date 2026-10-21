@@ -148,7 +148,18 @@ after the blackout endpoint has been captured.
 | `settings` | Read device platform settings and construct the thread pool. |
 | `state_read` | Retrieve and decode saved state from the host or persisted memory. |
 | `state_fixup` | Restore compatibility fixups, invalidate the persisted kexec state header, and prepare the timing ledger. The stale payload is zeroed after VTL0 resumes. |
-| `vm_build` | Reconstruct the VM, mappings, device managers, and channels. |
+| `vm_config` | Read VTL2 parameters and build the memory layout and processor topology. |
+| `vm_vmgs` | Open or restore the VMGS. |
+| `vm_memory` | Create the prototype partition, map guest memory, restore the DMA manager, and run the memory access self test. |
+| `vm_attestation` | Read provenance claims, unlock the VMGS, and check its ID. |
+| `vm_partition` | Read measured config, start VM time, and build the partition and VPs. |
+| `vm_controllers` | Wait for initial controller configuration and set up disk and NVMe resolvers. NVMe devices open later, in `vm_vmbus_devices`. |
+| `vm_chipset` | Configure and build the base chipset devices, including the TPM. |
+| `vm_vmbus` | Start or restore the VMBus server, VPCI relay, and host VMBus relay. |
+| `vm_vpci` | Offer IDE accelerator channels and VPCI devices. |
+| `vm_network` | Create or restore MANA NICs. |
+| `vm_vmbus_devices` | Offer VMBus devices, including storvsp controllers and the disks, such as NVMe namespaces, behind them. |
+| `vm_finish` | Finish the chipset, handle the hibernate token, create the partition unit, start VP tasks, and load firmware on cold boot. |
 | `restore` | Restore state units, including surrounding dispatch work. |
 | `restore_notify` | Report the restore result to the host; no host notification on kexec. |
 | `resume_wait` | Remaining worker setup and scheduling until VM start begins. |

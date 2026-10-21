@@ -603,7 +603,7 @@ impl UnderhillVmWorker {
 
         let is_post_servicing = servicing_state.is_some();
         let correlation_id = (servicing_state.as_ref()).and_then(|s| s.init_state.correlation_id);
-        let mut servicing_timeline = servicing_state.as_mut().and_then(|state| {
+        let servicing_timeline = servicing_state.as_mut().and_then(|state| {
             let timings = state.timings.take()?;
             let mut timeline = crate::reference_time::ServicingTimeline::default();
             timeline.record("stop_begin", state.init_state.vm_stop_reference_time);
@@ -632,6 +632,10 @@ impl UnderhillVmWorker {
                 init_state, units, ..
             }) => (Some(init_state), Some(units)),
         };
+        let build_timeline =
+            crate::reference_time::TimelineRecorder::new(servicing_timeline, move || {
+                timing_clock.as_ref()?.reference_time().ok()
+            });
 
         // Build the VM.
         let mut vm = new_underhill_vm(
@@ -648,6 +652,7 @@ impl UnderhillVmWorker {
                 remote_console_cfg: params.remote_console_cfg,
                 debugger_rpc: params.debugger_rpc,
                 control_send: params.control_send,
+                build_timeline,
             },
         )
         .instrument(tracing::info_span!(
@@ -656,10 +661,6 @@ impl UnderhillVmWorker {
             correlation_id = correlation_id.map(tracing::field::display)
         ))
         .await?;
-        if let Some(timeline) = &mut servicing_timeline {
-            timeline.record("vm_build", vm.partition.reference_time());
-        }
-        vm.servicing_timeline = servicing_timeline;
         vm.persisted_state_to_zero = persisted_state_to_zero;
 
         LOADED_VM.store(&vm);
@@ -727,6 +728,8 @@ struct UhVmParams {
     /// unclean termination of the VM (such as guest-requested power state
     /// transitions, triple faults, and host-driven VTL2 servicing).
     control_send: mesh::Sender<ControlRequest>,
+    /// Records servicing blackout checkpoints while the VM is built.
+    build_timeline: crate::reference_time::TimelineRecorder,
 }
 
 async fn read_device_platform_settings(
@@ -1571,6 +1574,7 @@ async fn new_underhill_vm(
         remote_console_cfg,
         debugger_rpc,
         control_send,
+        mut build_timeline,
     } = params;
 
     if let Ok(kernel_boot_time) = std::env::var("KERNEL_BOOT_TIME") {
@@ -1904,6 +1908,7 @@ async fn new_underhill_vm(
         new_aarch64_topology(platform, &boot_info.cpus)
             .context("failed to construct the processor topology")?
     };
+    build_timeline.record("vm_config");
 
     // also construct the VMGS nice and early, as much like the GET, it also
     // plays an important role during initial bringup
@@ -1984,6 +1989,7 @@ async fn new_underhill_vm(
         .as_ref()
         .and_then(|(_, vmgs)| vmgs.get_file_info(vmgs::FileId::TPM_NVRAM).ok())
         .map(|info| info.valid_bytes as usize);
+    build_timeline.record("vm_vmgs");
 
     // Determine if the VTL0 alias map is in use.
     let vtl0_alias_map_bit =
@@ -2114,6 +2120,7 @@ async fn new_underhill_vm(
         vtom,
     )
     .context("guest memory access self test failed")?;
+    build_timeline.record("vm_memory");
 
     // Set the gpa allocator to GET that is required by the attestation message.
     get_client.set_gpa_allocator(
@@ -2310,6 +2317,7 @@ async fn new_underhill_vm(
             anyhow::bail!("provisioning VMGSID mismatch");
         }
     }
+    build_timeline.record("vm_attestation");
 
     let mut resolver = ResourceResolver::new();
     // Make the GET available for other resources.
@@ -2438,6 +2446,7 @@ async fn new_underhill_vm(
         .context("failed to create partition")?;
 
     let partition = Arc::new(partition);
+    build_timeline.record("vm_partition");
 
     // By default, scale the max QD by the number of VPs to save memory
     // on smaller VMs, up to a QD of 256.
@@ -2538,6 +2547,7 @@ async fn new_underhill_vm(
     } else {
         None
     };
+    build_timeline.record("vm_controllers");
 
     let initial_generation_id = match dps.general.generation_id.map(u128::from_ne_bytes) {
         Some(0) | None => {
@@ -3254,6 +3264,7 @@ async fn new_underhill_vm(
     .instrument(tracing::info_span!("base_chipset_build", CVM_ALLOWED))
     .await
     .context("failed to create devices")?;
+    build_timeline.record("vm_chipset");
 
     // Add the x86 BSP's LINTs for the PIC to use.
     #[cfg(guest_arch = "x86_64")]
@@ -3534,6 +3545,7 @@ async fn new_underhill_vm(
 
         vmbus_server = Some(vmbus);
     }
+    build_timeline.record("vm_vmbus");
 
     let mut vmbus_device_handles = controllers.vmbus_devices;
 
@@ -3614,6 +3626,7 @@ async fn new_underhill_vm(
     if !controllers.vpci_devices.is_empty() {
         anyhow::bail!("built without vpci support");
     }
+    build_timeline.record("vm_vpci");
 
     let network_adapter_index = if is_restoring {
         NetworkAdapterIndex::restore(servicing_state.emuplat.network_adapter_index)
@@ -3682,6 +3695,7 @@ async fn new_underhill_vm(
     }
     let network_settings: Option<Box<dyn LoadedVmNetworkSettings>> =
         Some(Box::new(uh_network_settings));
+    build_timeline.record("vm_network");
 
     if let Some(framebuffer) = remote_console_cfg.framebuffer {
         resolver.add_resolver(FramebufferRemoteControl {
@@ -3762,6 +3776,7 @@ async fn new_underhill_vm(
             .await?,
         );
     }
+    build_timeline.record("vm_vmbus_devices");
 
     let control_send = Arc::new(Mutex::new(Some(control_send)));
 
@@ -3966,6 +3981,7 @@ async fn new_underhill_vm(
         .instrument(tracing::info_span!("load_firmware", CVM_ALLOWED))
         .await?;
     }
+    build_timeline.record("vm_finish");
 
     // Construct a LoadedVm struct directly, and call the common run loop.
     let loaded_vm = LoadedVm {
@@ -3979,7 +3995,7 @@ async fn new_underhill_vm(
         _halt_task: halt_task,
         state_units,
         last_state_unit_stop: (servicing_state.vm_stop_reference_time).map(ReferenceTime::new),
-        servicing_timeline: None,
+        servicing_timeline: build_timeline.into_timeline(),
         persisted_state_to_zero: None,
         partition,
         uevent_listener,

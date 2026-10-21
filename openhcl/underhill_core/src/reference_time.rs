@@ -111,6 +111,37 @@ impl ServicingTimeline {
     }
 }
 
+/// Records servicing timeline checkpoints where no partition is available to
+/// read the reference time from, such as while the VM is being built.
+pub(crate) struct TimelineRecorder {
+    timeline: Option<ServicingTimeline>,
+    clock: Box<dyn Fn() -> Option<u64> + Send + Sync>,
+}
+
+impl TimelineRecorder {
+    pub fn new(
+        timeline: Option<ServicingTimeline>,
+        clock: impl Fn() -> Option<u64> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            timeline,
+            clock: Box::new(clock),
+        }
+    }
+
+    /// Records the end of `phase`. The clock is only read while a servicing
+    /// timeline is being recorded.
+    pub fn record(&mut self, phase: &'static str) {
+        if let Some(timeline) = &mut self.timeline {
+            timeline.record_optional(phase, (self.clock)());
+        }
+    }
+
+    pub fn into_timeline(self) -> Option<ServicingTimeline> {
+        self.timeline
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -260,5 +291,34 @@ mod tests {
                 ("kernel_init", Duration::from_nanos(60000)),
             ]
         );
+    }
+
+    #[test]
+    fn timeline_recorder_splits_vm_build() {
+        let mut timeline = ServicingTimeline::default();
+        timeline.record("state_fixup", 100);
+        let now = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(100));
+        let clock = now.clone();
+        let mut recorder = TimelineRecorder::new(Some(timeline), move || {
+            Some(clock.load(std::sync::atomic::Ordering::Relaxed))
+        });
+        for (phase, time) in [("vm_config", 150), ("vm_finish", 400)] {
+            now.store(time, std::sync::atomic::Ordering::Relaxed);
+            recorder.record(phase);
+        }
+        assert_eq!(
+            recorder.into_timeline().unwrap().durations().unwrap(),
+            vec![
+                ("vm_config", Duration::from_nanos(5000)),
+                ("vm_finish", Duration::from_nanos(25000)),
+            ]
+        );
+    }
+
+    #[test]
+    fn timeline_recorder_skips_clock_without_timeline() {
+        let mut recorder = TimelineRecorder::new(None, || panic!("clock read on cold boot"));
+        recorder.record("vm_config");
+        assert!(recorder.into_timeline().is_none());
     }
 }
