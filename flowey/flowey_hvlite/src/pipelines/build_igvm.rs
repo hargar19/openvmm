@@ -194,6 +194,11 @@ pub struct BuildIgvmCliCustomizations {
     #[clap(long)]
     pub custom_extra_rootfs: Vec<PathBuf>,
 
+    /// Compress the initrd with zstd instead of gzip. The OpenHCL kernel must
+    /// be built with `CONFIG_RD_ZSTD=y`.
+    #[clap(long)]
+    pub initrd_zstd: bool,
+
     /// (experimental) Include the AP kernel in the IGVM file
     #[clap(long)]
     pub with_sidecar: bool,
@@ -337,6 +342,7 @@ impl IntoPipeline for BuildIgvmCli {
                     with_sidecar,
                     custom_sidecar,
                     mut custom_extra_rootfs,
+                    initrd_zstd,
                     max_trace_level,
                     custom_openvmm_deps,
                     custom_protoc,
@@ -462,6 +468,7 @@ impl IntoPipeline for BuildIgvmCli {
                 with_mi_secure,
                 disable_secure_avic,
                 enable_product_policy,
+                initrd_zstd,
                 confidential_debug,
                 override_kernel_pkg: override_kernel_pkg.map(|p| match p {
                     KernelPackageKindCli::Main => OpenhclKernelPackage::Main,

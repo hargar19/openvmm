@@ -24,6 +24,7 @@ class Config:
     CPIO = "cpio"
     EXECSTACK = "execstack"
     GZIP = "gzip"
+    ZSTD = "zstd"
     BINWALK = "binwalk"
     LSINITRAMFS = "lsinitramfs"
     REQUIRED_TOOLS = [
@@ -88,10 +89,49 @@ def generate_build_info(path: str):
         f.write(json.dumps(build_data, ensure_ascii=False, indent=4))
 
 
+def read_layer_as_cpio(path: str) -> bytes:
+    with open(path, 'rb') as f:
+        data = f.read()
+    if data[:2] == b'\x1f\x8b':
+        return gzip.decompress(data)
+    if data[:6] == b'070701':
+        return data
+    raise Exception(f"Layer '{path}' must be a gzip-compressed or uncompressed newc cpio archive")
+
+
+def build_zstd_initrd(temp_dir: str, rootfs_config_path: List[str], updated_initramfs_path: str,
+                      additional_layers: List[str], additional_dirs: List[str]):
+    cpio_path = os.path.join(temp_dir, 'underhill.cpio')
+    stat = create_cpio_from_config(rootfs_config_path, cpio_path, 'none')
+    eprint(f"The initial root fs size, bytes: {stat}")
+
+    # Linux requires each concatenated archive to start 4-byte aligned.
+    def append_cpio(out, data: bytes):
+        out.write(b'\0' * (-out.tell() % 4))
+        out.write(data)
+
+    with open(cpio_path, 'ab') as out:
+        for dir_name in additional_dirs:
+            dir_cpio = os.path.join(temp_dir, "add_dir.cpio")
+            create_cpio_from_dir(dir_name, dir_cpio, 'none')
+            with open(dir_cpio, 'rb') as f:
+                append_cpio(out, f.read())
+            os.unlink(dir_cpio)
+
+        for layer in additional_layers:
+            eprint(f"Adding layer {layer}, size: {os.path.getsize(layer)} bytes")
+            append_cpio(out, read_layer_as_cpio(layer))
+
+    eprint(f'Size of the uncompressed initial RAM FS {os.path.getsize(cpio_path)} bytes')
+    # Same level the kernel build uses for zstd initramfs images.
+    subprocess.run([Config.ZSTD, '-19', '-q', '-f', cpio_path, '-o', updated_initramfs_path], check=True)
+    eprint(f'Size of the updated initial RAM FS {os.path.getsize(updated_initramfs_path)} bytes')
+
+
 def process(temp_dir: str, underhill_path: str, kernel_path: str,
             modules_path: str, kernel_metadata_path: str, build_info: str, rootfs_config_path: List[str],
             updated_initramfs_path: str, additional_layers: List[str],
-            additional_dirs: List[str]):
+            additional_dirs: List[str], compression: str):
     align = lambda x, boundary: (x + boundary-1) & ~(boundary-1)
 
     eprint("Building the initial root fs")
@@ -110,6 +150,11 @@ def process(temp_dir: str, underhill_path: str, kernel_path: str,
     os.environ["OPENHCL_MODULES_PATH"] = modules_path
     os.environ["OPENHCL_KERNEL_METADATA"] = kernel_metadata_path
     os.environ["OPENHCL_BUILD_INFO"] = build_info
+
+    if compression == 'zstd':
+        build_zstd_initrd(temp_dir, rootfs_config_path, updated_initramfs_path,
+                          additional_layers, additional_dirs)
+        return
 
     stat = create_cpio_from_config(rootfs_config_path, underhill_cpio_gz_file_name, 'gzip')
     eprint(f"The initial root fs size, bytes: {stat}")
@@ -161,6 +206,8 @@ def main():
     parser.add_argument('--rootfs-config', action='append', help='Configuration file for the root filesystem')
     parser.add_argument('--layer', action='append', help='Adds a custom layer file.')
     parser.add_argument('--add-dir', action='append', help='Adds a directory.')
+    parser.add_argument('--compression', choices=('gzip', 'zstd'), default='gzip',
+        help='Initrd compression. zstd needs CONFIG_RD_ZSTD in the OpenHCL kernel.')
     parser.set_defaults(layer=[], add_dir=[], rootfs_config=[])
 
     args, _  = parser.parse_known_args()
@@ -207,6 +254,8 @@ def main():
     for required_tool in Config.REQUIRED_TOOLS:
         if shutil.which(required_tool) is None:
             raise Exception(f"Can't find {required_tool}")
+    if args.compression == 'zstd' and shutil.which(Config.ZSTD) is None:
+        raise Exception(f"Can't find {Config.ZSTD}, required for --compression zstd")
 
     underhill_path = os.path.realpath(args.underhill_path)
     build_info = args.build_info
@@ -231,7 +280,7 @@ def main():
             str(temp_dir),
             underhill_path, kernel_path, modules_path, kernel_metadata_path, build_info, args.rootfs_config,
             updated_initramfs_path, additional_layers,
-            additional_dirs)
+            additional_dirs, args.compression)
 
 
 if __name__ == '__main__':

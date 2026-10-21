@@ -19,6 +19,8 @@ pub struct OpenhclInitrdExtraParams {
     pub extra_initrd_layers: Vec<PathBuf>,
     /// additional directories to be included in the initrd
     pub extra_initrd_directories: Vec<PathBuf>,
+    /// compress with zstd instead of gzip (kernel needs `CONFIG_RD_ZSTD`)
+    pub zstd: bool,
 }
 
 flowey_request! {
@@ -102,6 +104,7 @@ impl FlowNode for Node {
             let OpenhclInitrdExtraParams {
                 extra_initrd_layers,
                 extra_initrd_directories,
+                zstd,
             } = extra_params.unwrap_or_default();
 
             let interactive_dep = if interactive {
@@ -146,7 +149,11 @@ impl FlowNode for Node {
                     let kernel_package_root = rt.read(kernel_package_root);
                     let kernel_metadata = rt.read(kernel_metadata);
 
-                    let initrd_path = rt.sh.current_dir().join("openhcl.cpio.gz");
+                    let initrd_path = rt.sh.current_dir().join(if zstd {
+                        "openhcl.cpio.zst"
+                    } else {
+                        "openhcl.cpio.gz"
+                    });
 
                     let initrd_contents = {
                         let mut v = Vec::new();
@@ -167,6 +174,11 @@ impl FlowNode for Node {
                         for dir in extra_initrd_directories {
                             v.push("--add-dir".into());
                             v.push(dir.display().to_string());
+                        }
+
+                        if zstd {
+                            v.push("--compression".into());
+                            v.push("zstd".into());
                         }
 
                         v

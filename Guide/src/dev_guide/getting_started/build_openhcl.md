@@ -165,6 +165,11 @@ Some examples of potentially useful customization include:
     remains available for local kernel development without enabling those
     variants.
 
+- `--initrd-zstd`: Compress the initrd with zstd instead of gzip. This needs
+    a VTL2 kernel built with `CONFIG_RD_ZSTD=y` and `zstd` on the build host.
+    Layers passed with `--custom-layer` must be gzip-compressed or
+    uncompressed newc cpio archives.
+
 For a full list of available customizations, refer to `build-igvm --help`.
 
 ### Experimental IGVM kexec payloads

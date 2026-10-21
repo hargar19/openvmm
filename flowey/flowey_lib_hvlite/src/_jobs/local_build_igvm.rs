@@ -38,6 +38,7 @@ pub struct Customizations {
     pub confidential_debug: bool,
     pub disable_secure_avic: bool,
     pub enable_product_policy: bool,
+    pub initrd_zstd: bool,
     pub override_arch: Option<CommonArch>,
     pub override_kernel_pkg: Option<OpenhclKernelPackage>,
     pub override_manifest: Option<PathBuf>,
@@ -103,6 +104,7 @@ impl SimpleFlowNode for Node {
             confidential_debug,
             disable_secure_avic,
             enable_product_policy,
+            initrd_zstd,
             with_debuginfo,
             with_mi_secure,
             with_perf_tools,
@@ -165,6 +167,7 @@ impl SimpleFlowNode for Node {
                         .into_iter()
                         .map(|p| p.absolute())
                         .collect::<Result<_, _>>()?,
+                    zstd: initrd_zstd,
                 }),
                 custom_openvmm_hcl: custom_openvmm_hcl.map(|p| p.absolute()).transpose()?,
                 custom_openhcl_boot: custom_openhcl_boot.map(|p| p.absolute()).transpose()?,
