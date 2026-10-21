@@ -251,6 +251,11 @@ fn build_kernel_command_line(
         }
     }
 
+    // Kexec servicing stages its images in KHO scratch memory.
+    if cfg!(target_arch = "x86_64") && !params.isolation_type.is_hardware_isolated() {
+        write!(cmdline, "kho=on ")?;
+    }
+
     // Enable the com3 console by default if it's available and we're not
     // isolated, or if we are isolated but also have debugging enabled.
     //

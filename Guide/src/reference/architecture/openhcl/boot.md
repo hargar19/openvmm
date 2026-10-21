@@ -176,6 +176,15 @@ servicing's `handoff`, `bootloader`, and `kernel_init`. Without a
 composite bootstrap, `kexec_jump_kernel_init` reports the remaining
 interval as one phase.
 
+x86 `kexec_file_load` hashes every loaded segment before entering the new
+kernel, which costs about 4 ms per MiB in the unaccelerated purgatory. The
+boot shim adds `kho=on` for non-isolated x64 VMs, so kexec handover (KHO)
+places every segment in its scratch memory, which holds no DMA targets, and
+the outgoing kernel skips the hash. Without KHO and with
+`CONFIG_KEXEC_VERIFY_DIGEST_IN_KERNEL`, the outgoing kernel checks the same
+digest with its accelerated SHA-256 library after device shutdown, and the
+purgatory skips its own check only after a match.
+
 For host servicing, `handoff` includes serialization and host state
 transfer/restart. Separating host processing from transfer and restart
 requires host-side timestamps. Image staging before VM stop is outside
