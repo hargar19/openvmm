@@ -366,11 +366,49 @@ pub fn write_reserved_vtl2_memory(gpa: u64, data: &[u8]) -> anyhow::Result<()> {
         .write_at((gpa - start) as usize, data)
 }
 
+/// Identifies the kexec reboot reference time stored after the servicing state.
+const KEXEC_TRIGGER_MAGIC: u64 = u64::from_le_bytes(*b"OHCLKXTR");
+
+/// Region offsets of the `[magic, reference_time]` kexec trigger record.
+fn kexec_trigger_range(payload_len: u64) -> std::ops::Range<u64> {
+    let start = payload_len.next_multiple_of(8);
+    start..start + 16
+}
+
+/// Store `now()`, sampled after mapping, after a persisted servicing state of
+/// `payload_len` bytes.
+pub fn write_kexec_trigger_time(
+    parsed: &ParsedBootDtInfo,
+    payload_len: usize,
+    now: impl FnOnce() -> u64,
+) -> anyhow::Result<()> {
+    let region = parsed.vtl2_persisted_servicing_state;
+    let trigger = kexec_trigger_range(payload_len as u64);
+    anyhow::ensure!(
+        trigger.end <= region.len(),
+        "no room for the kexec trigger time"
+    );
+    let ranges = [region];
+    let mapping = Vtl2ParamsMap::new_writeable(&ranges)
+        .context("failed to map persisted servicing state region")?;
+    mapping.write_at(
+        trigger.start as usize,
+        [KEXEC_TRIGGER_MAGIC, now()].as_bytes(),
+    )
+}
+
+/// Servicing state left in persisted memory by a kexec predecessor.
+pub struct PersistedServicingState {
+    pub state: Vec<u8>,
+    /// Reference time when the predecessor requested the kexec reboot.
+    pub kexec_trigger_time: Option<u64>,
+}
+
 /// Read servicing state from the persisted servicing state region after a kexec
 /// restart. Returns `None` if no servicing state is stored.
 pub fn read_servicing_state_from_persisted(
     parsed: &ParsedBootDtInfo,
-) -> anyhow::Result<Option<Vec<u8>>> {
+) -> anyhow::Result<Option<PersistedServicingState>> {
     use loader_defs::shim::PersistedStateHeader;
 
     let header_ranges = [parsed.vtl2_persisted_header];
@@ -423,7 +461,20 @@ pub fn read_servicing_state_from_persisted(
         .read_at(0, &mut buf)
         .context("failed to read servicing state")?;
 
-    Ok(Some(buf))
+    let trigger = kexec_trigger_range(header.servicing_state_payload_len);
+    let kexec_trigger_time = if trigger.end <= region.len() {
+        let [magic, time]: [u64; 2] = mapping
+            .read_plain(trigger.start as usize)
+            .context("failed to read kexec trigger time")?;
+        (magic == KEXEC_TRIGGER_MAGIC).then_some(time)
+    } else {
+        None
+    };
+
+    Ok(Some(PersistedServicingState {
+        state: buf,
+        kexec_trigger_time,
+    }))
 }
 
 /// Clear servicing state after it has been decoded successfully.
@@ -450,8 +501,11 @@ pub fn clear_servicing_state_from_persisted(parsed: &ParsedBootDtInfo) -> anyhow
     let mapping = Vtl2ParamsMap::new_writeable(&ranges)
         .context("failed to map persisted servicing state region")?;
     if header.servicing_state_payload_len <= region.len() {
+        let len = kexec_trigger_range(header.servicing_state_payload_len)
+            .end
+            .min(region.len());
         mapping
-            .write_at(0, &vec![0u8; header.servicing_state_payload_len as usize])
+            .write_at(0, &vec![0u8; len as usize])
             .context("failed to zero servicing state region")?;
     }
 

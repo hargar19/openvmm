@@ -48,6 +48,15 @@ pub(crate) struct ServicingTimeline {
     checkpoints: Vec<(&'static str, Option<u64>)>,
 }
 
+/// Kexec handoff checkpoints recorded outside the incoming worker.
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct KexecHandoffTimes {
+    /// Just before the outgoing instance requested the kexec reboot.
+    pub trigger: Option<u64>,
+    /// Composite bootstrap entry and its jump to Linux.
+    pub bootstrap: Option<(u64, u64)>,
+}
+
 impl ServicingTimeline {
     pub fn record(&mut self, phase: &'static str, reference_time: u64) {
         self.record_optional(phase, Some(reference_time));
@@ -59,17 +68,31 @@ impl ServicingTimeline {
 
     pub fn record_boot(
         &mut self,
-        kexec: bool,
+        kexec: Option<KexecHandoffTimes>,
         boot_times: Option<bootloader_fdt_parser::BootTimes>,
         worker_entry: Option<u64>,
     ) {
-        self.method = if kexec { "kexec" } else { "host" };
-        if kexec {
-            self.record_optional("handoff_kernel_init", worker_entry);
-        } else {
-            self.record_optional("handoff", boot_times.and_then(|times| times.start));
-            self.record_optional("bootloader", boot_times.and_then(|times| times.end));
-            self.record_optional("kernel_init", worker_entry);
+        self.method = if kexec.is_some() { "kexec" } else { "host" };
+        match kexec {
+            Some(KexecHandoffTimes {
+                trigger: Some(trigger),
+                bootstrap,
+            }) => {
+                self.record("kexec_prep", trigger);
+                if let Some((entry, exit)) = bootstrap {
+                    self.record("kexec_jump", entry);
+                    self.record("bootstrap", exit);
+                    self.record_optional("kernel_init", worker_entry);
+                } else {
+                    self.record_optional("kexec_jump_kernel_init", worker_entry);
+                }
+            }
+            Some(_) => self.record_optional("handoff_kernel_init", worker_entry),
+            None => {
+                self.record_optional("handoff", boot_times.and_then(|times| times.start));
+                self.record_optional("bootloader", boot_times.and_then(|times| times.end));
+                self.record_optional("kernel_init", worker_entry);
+            }
         }
     }
 
@@ -164,7 +187,7 @@ mod tests {
         for boot_times in [None, Some(old_boot)] {
             let mut timeline = ServicingTimeline::default();
             timeline.record("flush", 100);
-            timeline.record_boot(true, boot_times, Some(900));
+            timeline.record_boot(Some(KexecHandoffTimes::default()), boot_times, Some(900));
             assert_eq!(timeline.method, "kexec");
             assert_eq!(
                 timeline.durations().unwrap(),
@@ -174,11 +197,52 @@ mod tests {
     }
 
     #[test]
+    fn servicing_timeline_kexec_splits_handoff() {
+        let mut timeline = ServicingTimeline::default();
+        timeline.record("flush", 100);
+        timeline.record_boot(
+            Some(KexecHandoffTimes {
+                trigger: Some(110),
+                bootstrap: Some((500, 530)),
+            }),
+            None,
+            Some(900),
+        );
+        assert_eq!(
+            timeline.durations().unwrap(),
+            vec![
+                ("kexec_prep", Duration::from_nanos(1000)),
+                ("kexec_jump", Duration::from_nanos(39000)),
+                ("bootstrap", Duration::from_nanos(3000)),
+                ("kernel_init", Duration::from_nanos(37000)),
+            ]
+        );
+
+        let mut timeline = ServicingTimeline::default();
+        timeline.record("flush", 100);
+        timeline.record_boot(
+            Some(KexecHandoffTimes {
+                trigger: Some(110),
+                bootstrap: None,
+            }),
+            None,
+            Some(900),
+        );
+        assert_eq!(
+            timeline.durations().unwrap(),
+            vec![
+                ("kexec_prep", Duration::from_nanos(1000)),
+                ("kexec_jump_kernel_init", Duration::from_nanos(79000)),
+            ]
+        );
+    }
+
+    #[test]
     fn servicing_timeline_host_boot_partitions_same_interval() {
         let mut timeline = ServicingTimeline::default();
         timeline.record("flush", 100);
         timeline.record_boot(
-            false,
+            None,
             Some(bootloader_fdt_parser::BootTimes {
                 start: Some(200),
                 end: Some(300),

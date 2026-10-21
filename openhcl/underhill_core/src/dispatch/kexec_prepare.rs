@@ -126,7 +126,7 @@ pub(super) fn prepare_kexec(
         "cannot replace the active sidecar without an incoming kexec bootstrap and reserved kexec sidecar regions"
     );
     let plan = sidecar.as_ref().map(|sidecar| &*sidecar.plan);
-    let cmdline = build_kexec_cmdline(&raw_cmdline, plan)?;
+    let cmdline = build_kexec_cmdline(&raw_cmdline, plan, payload.bootstrap.is_some())?;
     let online_cpus = online_cpu_mask()?;
     let kernel = stage_kernel(&payload, plan).context("failed to stage servicing kernel")?;
     let initrd = stage_file(&payload.initrd, "openhcl-kexec-initrd")
@@ -195,14 +195,26 @@ pub(super) fn online_cpu_mask() -> anyhow::Result<String> {
         .to_owned())
 }
 
-/// The bootstrap narrows the padded all-CPU `boot_cpus=` value in place.
-fn build_kexec_cmdline(raw: &str, plan: Option<&SidecarPlan>) -> anyhow::Result<CString> {
+/// The bootstrap narrows the padded all-CPU `boot_cpus=` value in place and
+/// fills the padded timing value.
+fn build_kexec_cmdline(
+    raw: &str,
+    plan: Option<&SidecarPlan>,
+    bootstrap: bool,
+) -> anyhow::Result<CString> {
+    use loader_defs::kexec::BOOTSTRAP_TIMES_PARAM;
+    use loader_defs::kexec::BOOTSTRAP_TIMES_WIDTH;
+
     let raw = CString::new(raw).context("kernel command line contains a NUL byte")?;
     let mut cmdline = raw
         .to_str()?
         .split_whitespace()
         .filter(|word| {
-            !word.starts_with("boot_cpus=") && !word.starts_with("OPENHCL_KEXEC_SERVICING=")
+            !word.starts_with("boot_cpus=")
+                && !word.starts_with("OPENHCL_KEXEC_SERVICING=")
+                && !word
+                    .strip_prefix(BOOTSTRAP_TIMES_PARAM)
+                    .is_some_and(|rest| rest.starts_with('='))
         })
         .fold(String::new(), |cmdline, word| cmdline + word + " ");
     if let Some(plan) = plan {
@@ -210,6 +222,13 @@ fn build_kexec_cmdline(raw: &str, plan: Option<&SidecarPlan>) -> anyhow::Result<
         let width = plan.boot_cpus_width as usize;
         anyhow::ensure!(value.len() <= width, "boot_cpus placeholder too narrow");
         write!(cmdline, "boot_cpus={value:<width$} ")?;
+    }
+    if bootstrap {
+        write!(
+            cmdline,
+            "{BOOTSTRAP_TIMES_PARAM}={:BOOTSTRAP_TIMES_WIDTH$} ",
+            ""
+        )?;
     }
     cmdline.push_str("OPENHCL_KEXEC_SERVICING=1");
     CString::new(cmdline).context("invalid kexec command line")
@@ -1824,14 +1843,30 @@ mod tests {
 
     #[test]
     fn cmdline_removes_all_stale_options_and_adds_one_marker() {
-        let cmdline = build_kexec_cmdline("console=ttyS0 boot_cpus=1 OPENHCL_KEXEC_SERVICING=0\nroot=/dev/ram0 boot_cpus=2 OPENHCL_KEXEC_SERVICING=1", None).unwrap();
+        let cmdline = build_kexec_cmdline("console=ttyS0 boot_cpus=1 OPENHCL_KEXEC_SERVICING=0\nroot=/dev/ram0 boot_cpus=2 OPENHCL_KEXEC_SERVICING=1 OPENHCL_KEXEC_BOOTSTRAP_TIMES= OPENHCL_KEXEC_BOOTSTRAP_TIMES=1,2 OPENHCL_KEXEC_BOOTSTRAP_TIMESX=3", None, false).unwrap();
         assert_eq!(
             cmdline.to_str().unwrap(),
-            "console=ttyS0 root=/dev/ram0 OPENHCL_KEXEC_SERVICING=1"
+            "console=ttyS0 root=/dev/ram0 OPENHCL_KEXEC_BOOTSTRAP_TIMESX=3 OPENHCL_KEXEC_SERVICING=1"
         );
         assert_eq!(
-            build_kexec_cmdline(" \n", None).unwrap().to_str().unwrap(),
+            build_kexec_cmdline(" \n", None, false)
+                .unwrap()
+                .to_str()
+                .unwrap(),
             "OPENHCL_KEXEC_SERVICING=1"
+        );
+    }
+
+    #[test]
+    fn cmdline_pads_bootstrap_times_placeholder() {
+        let cmdline =
+            build_kexec_cmdline("a OPENHCL_KEXEC_BOOTSTRAP_TIMES=1,2", None, true).unwrap();
+        assert_eq!(
+            cmdline.to_str().unwrap(),
+            format!(
+                "a OPENHCL_KEXEC_BOOTSTRAP_TIMES={} OPENHCL_KEXEC_SERVICING=1",
+                " ".repeat(loader_defs::kexec::BOOTSTRAP_TIMES_WIDTH)
+            )
         );
     }
 
@@ -1841,13 +1876,13 @@ mod tests {
         let mut plan = SidecarPlan::new_zeroed();
         plan.cpu_count = 64;
         plan.boot_cpus_width = 8;
-        let cmdline = build_kexec_cmdline("a boot_cpus=0,32 b", Some(&plan)).unwrap();
+        let cmdline = build_kexec_cmdline("a boot_cpus=0,32 b", Some(&plan), false).unwrap();
         assert_eq!(
             cmdline.to_str().unwrap(),
             "a b boot_cpus=0-63     OPENHCL_KEXEC_SERVICING=1"
         );
         plan.boot_cpus_width = 3;
-        assert!(build_kexec_cmdline("a", Some(&plan)).is_err());
+        assert!(build_kexec_cmdline("a", Some(&plan), false).is_err());
     }
 
     #[test]
@@ -1870,7 +1905,7 @@ mod tests {
             "boot_cpus=1\0",
             "OPENHCL_KEXEC_SERVICING=0\0",
         ] {
-            assert!(build_kexec_cmdline(raw, None).is_err());
+            assert!(build_kexec_cmdline(raw, None, false).is_err());
         }
     }
 }

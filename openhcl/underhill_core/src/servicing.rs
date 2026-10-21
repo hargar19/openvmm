@@ -17,13 +17,38 @@ fn kexec_servicing_marker(value: Option<&std::ffi::OsStr>) -> bool {
     value == Some(std::ffi::OsStr::new("1"))
 }
 
+/// Composite bootstrap entry and Linux handoff reference times, if reported.
+pub(crate) fn kexec_bootstrap_times() -> Option<(u64, u64)> {
+    parse_bootstrap_times(&std::env::var(loader_defs::kexec::BOOTSTRAP_TIMES_PARAM).ok()?)
+}
+
+fn parse_bootstrap_times(value: &str) -> Option<(u64, u64)> {
+    let (entry, exit) = value.split_once(',')?;
+    Some((
+        u64::from_str_radix(entry, 16).ok()?,
+        u64::from_str_radix(exit, 16).ok()?,
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::ServicingTimings;
     use super::kexec_servicing_marker;
+    use super::parse_bootstrap_times;
     use mesh::payload::Protobuf;
     use std::ffi::OsStr;
     use test_with_tracing::test;
+
+    #[test]
+    fn bootstrap_times_require_both_hex_values() {
+        assert_eq!(
+            parse_bootstrap_times("000000000000000a,ffffffffffffffff"),
+            Some((10, u64::MAX))
+        );
+        for value in ["", "a", "a,", ",a", "a,b,c", "g,1"] {
+            assert_eq!(parse_bootstrap_times(value), None, "{value}");
+        }
+    }
 
     #[test]
     fn only_explicit_kexec_marker_disables_cold_boot() {

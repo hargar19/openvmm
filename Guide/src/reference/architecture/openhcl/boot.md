@@ -139,8 +139,12 @@ after the blackout endpoint has been captured.
 | `flush` | Log-flush request and completion, including surrounding orchestration. |
 | `handoff` (host only) | Flush completion through the next bootloader's start checkpoint. |
 | `bootloader` (host only) | Bootloader start through its saved end checkpoint; includes sidecar setup. |
-| `kernel_init` (host only) | Bootloader tail, kernel boot, init process, VMM and transport startup, through VM worker initialization entry. |
-| `handoff_kernel_init` (kexec only) | Flush completion through VM worker initialization entry, without a bootloader run. |
+| `kernel_init` | Host: bootloader tail, kernel boot, init process, VMM and transport startup, through VM worker initialization entry. Kexec: the same from the bootstrap's jump to Linux. |
+| `kexec_prep` (kexec only) | Flush completion through the reboot request: serialization, state persistence, and sidecar preparation. |
+| `kexec_jump` (kexec only) | Reboot request through bootstrap entry: old-kernel shutdown, segment digest check, and segment relocation. |
+| `bootstrap` (kexec only) | Composite bootstrap entry through its jump to Linux; includes fresh sidecar startup. |
+| `kexec_jump_kernel_init` (kexec only) | Reboot request through VM worker initialization entry when no bootstrap times are reported. |
+| `handoff_kernel_init` (kexec only) | Flush completion through VM worker initialization entry when the predecessor recorded no reboot request time. |
 | `settings` | Read device platform settings and construct the thread pool. |
 | `state_read` | Retrieve and decode saved state from the host or persisted memory. |
 | `state_fixup` | Restore compatibility fixups, clear persisted kexec state, and prepare the timing ledger. |
@@ -150,12 +154,16 @@ after the blackout endpoint has been captured.
 | `resume_wait` | Remaining worker setup and scheduling until VM start begins. |
 | `start` | Start state units through the existing blackout endpoint. |
 
-Kexec loads the extracted kernel and initrd directly and bypasses
-`openhcl_boot`. Any retained bootloader timestamps describe an earlier boot
-and must not be used for this transition. Compare its `handoff_kernel_init`
-with the sum of host servicing's `handoff`, `bootloader`, and `kernel_init`.
-The kexec interval includes serialization, local state persistence, sidecar
-preparation, kernel handoff, and startup of the new kernel and userspace.
+Kexec bypasses the full `openhcl_boot` run. Any retained bootloader
+timestamps describe an earlier boot and must not be used for this
+transition. The outgoing instance stores the reboot request time after the
+persisted servicing state. A composite image's bootstrap fills a padded
+`OPENHCL_KEXEC_BOOTSTRAP_TIMES=` command-line value with its entry and
+Linux handoff times, which reach the worker as an environment variable.
+Compare the sum of the kexec handoff phases with the sum of host
+servicing's `handoff`, `bootloader`, and `kernel_init`. Without a
+composite bootstrap, `kexec_jump_kernel_init` reports the remaining
+interval as one phase.
 
 For host servicing, `handoff` includes serialization and host state
 transfer/restart. Separating host processing from transfer and restart

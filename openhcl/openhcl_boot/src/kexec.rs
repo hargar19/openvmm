@@ -15,7 +15,7 @@ use sidecar_defs::NUM_CPUS_SUPPORTED_FOR_PER_CPU_STATE;
 use sidecar_defs::SidecarNodeParams;
 use sidecar_defs::SidecarParams;
 
-const BOOT_CPUS: &[u8] = b"boot_cpus=";
+const BOOT_CPUS: &[u8] = b"boot_cpus";
 const MAX_BOOT_CPUS_WIDTH: usize = 1024;
 const FDT_MAGIC: u32 = 0xd00dfeed;
 const FDT_PROP: u32 = 3;
@@ -113,19 +113,21 @@ fn boot_cpus(
     (list.len() <= plan.boot_cpus_width as usize).then_some(list)
 }
 
-/// Overwrite the space-padded `boot_cpus=` value staged by the predecessor.
-fn patch_boot_cpus(cmdline: &mut [u8], value: &str, width: usize) -> bool {
+/// Overwrite the space-padded `key=` value staged by the predecessor.
+fn patch_padded(cmdline: &mut [u8], key: &[u8], value: &str, width: usize) -> bool {
     let len = cmdline
         .iter()
         .position(|&b| b == 0)
         .unwrap_or(cmdline.len());
     let cmdline = &mut cmdline[..len];
     let Some(start) = (0..len).find(|&index| {
-        cmdline[index..].starts_with(BOOT_CPUS) && (index == 0 || cmdline[index - 1] == b' ')
+        cmdline[index..].starts_with(key)
+            && cmdline.get(index + key.len()) == Some(&b'=')
+            && (index == 0 || cmdline[index - 1] == b' ')
     }) else {
         return false;
     };
-    let start = start + BOOT_CPUS.len();
+    let start = start + key.len() + 1;
     let Some(field) = start
         .checked_add(width)
         .filter(|&end| end <= len && (end == len || cmdline[end] == b' '))
@@ -265,6 +267,7 @@ pub unsafe fn start_composite(boot_params: u64) -> ! {
     use loader_defs::kexec::COMPOSITE_ALIGNMENT;
     use loader_defs::kexec::CompositeHeader;
 
+    let entry_time = minimal_rt::reftime::reference_time();
     unsafe extern "C" {
         static __ehdr_start: u8;
     }
@@ -295,17 +298,46 @@ pub unsafe fn start_composite(boot_params: u64) -> ! {
         // before any of its addresses are used.
         unsafe { prepare_sidecar(base, layout.image_size, &mut handoff, plan) }
     });
+    let boot_params = handoff.boot_params;
     // SAFETY: the checked layout dedicates this disjoint page to the handoff.
     unsafe { (handoff_address as *mut BootHandoff).write(handoff) };
+    let finish = move |output: &sidecar_defs::SidecarOutput| {
+        if let Some(prepared) = prepared {
+            prepared.retarget_device_tree(plan, output);
+        }
+        // SAFETY: kexec maps the boot parameters validated by `relocate`.
+        unsafe { report_times(boot_params, entry_time) };
+    };
     // SAFETY: all handoff addresses were constructed from the loaded composite
     // or the plan's reserved region.
-    unsafe {
-        start(handoff_address, move |output| {
-            if let Some(prepared) = prepared {
-                prepared.retarget_device_tree(plan, output);
-            }
-        })
+    unsafe { start(handoff_address, finish) }
+}
+
+/// Fill the staged timing placeholder with the entry and Linux handoff times.
+/// A predecessor that staged no placeholder gets no times.
+///
+/// # Safety
+/// The boot parameters and command line must be identity mapped.
+#[cfg(minimal_rt)]
+unsafe fn report_times(boot_params: u64, entry_time: u64) {
+    use loader_defs::kexec::BOOTSTRAP_TIMES_PARAM;
+    use loader_defs::kexec::BOOTSTRAP_TIMES_WIDTH;
+
+    let exit_time = minimal_rt::reftime::reference_time();
+    let mut value = ArrayString::<BOOTSTRAP_TIMES_WIDTH>::new();
+    if write!(value, "{entry_time:016x},{exit_time:016x}").is_err() {
+        return;
     }
+    // SAFETY: guaranteed by the caller.
+    let boot_params = unsafe { &*(boot_params as *const loader_defs::linux::boot_params) };
+    // SAFETY: guaranteed by the caller.
+    let cmdline = unsafe { cmdline(boot_params) };
+    patch_padded(
+        cmdline,
+        BOOTSTRAP_TIMES_PARAM.as_bytes(),
+        &value,
+        BOOTSTRAP_TIMES_WIDTH,
+    );
 }
 
 /// Device-tree updates that must follow sidecar initialization.
@@ -543,7 +575,7 @@ unsafe fn prepare_sidecar(
     });
     // SAFETY: the command line is in kexec's mapped boot-parameter segment.
     let cmdline = unsafe { cmdline(boot_params) };
-    if !patch_boot_cpus(cmdline, &list, plan.boot_cpus_width as usize) {
+    if !patch_padded(cmdline, BOOT_CPUS, &list, plan.boot_cpus_width as usize) {
         // The staged all-CPU placeholder remains; sidecar must not run.
         params.node_count = 0;
         started = [false; MAX_SIDECAR_PLAN_CHUNKS];
@@ -671,6 +703,8 @@ unsafe fn start(handoff_address: u64, finish: impl FnOnce(&sidecar_defs::Sidecar
 #[cfg(test)]
 mod tests {
     use super::*;
+    use loader_defs::kexec::BOOTSTRAP_TIMES_PARAM;
+    use loader_defs::kexec::BOOTSTRAP_TIMES_WIDTH;
     use loader_defs::kexec::PhysicalRange;
     use sidecar_defs::SidecarNodeParams;
     use test_with_tracing::test;
@@ -889,17 +923,39 @@ mod tests {
     #[test]
     fn kexec_patches_padded_boot_cpus_in_place() {
         let mut cmdline = *b"a boot_cpus=0-63     b\0junk";
-        assert!(patch_boot_cpus(&mut cmdline, "0,32", 8));
+        assert!(patch_padded(&mut cmdline, BOOT_CPUS, "0,32", 8));
         assert_eq!(&cmdline, b"a boot_cpus=0,32     b\0junk");
         for (input, width, value) in [
             (&b"a b"[..], 9, "0"),
             (b"xboot_cpus=0-63      b", 9, "0"),
+            (b"boot_cpus 0-63       b", 9, "0"),
             (b"boot_cpus=0-63 1     b", 9, "0"),
             (b"boot_cpus=0-63      ", 9, "0123456789"),
             (b"boot_cpus=0-63      b", 12, "0"),
         ] {
-            assert!(!patch_boot_cpus(&mut input.to_vec(), value, width));
+            assert!(!patch_padded(&mut input.to_vec(), BOOT_CPUS, value, width));
         }
+    }
+
+    #[test]
+    fn kexec_fills_bootstrap_times_placeholder() {
+        let mut cmdline = format!(
+            "a {BOOTSTRAP_TIMES_PARAM}={:width$} b",
+            "",
+            width = BOOTSTRAP_TIMES_WIDTH
+        )
+        .into_bytes();
+        let value = format!("{:016x},{:016x}", 1, u64::MAX);
+        assert!(patch_padded(
+            &mut cmdline,
+            BOOTSTRAP_TIMES_PARAM.as_bytes(),
+            &value,
+            BOOTSTRAP_TIMES_WIDTH
+        ));
+        assert_eq!(
+            cmdline,
+            format!("a {BOOTSTRAP_TIMES_PARAM}={value} b").into_bytes()
+        );
     }
 
     #[test]

@@ -797,6 +797,14 @@ impl LoadedVm {
                 "CPU ownership changed after kexec staging: {staged_online_cpus} -> {current_online_cpus}"
             );
             tracing::debug!(CVM_ALLOWED, %correlation_id, saved_state_len = state_buf.len(), "triggering guest-driven kexec reboot");
+            if let Err(err) = crate::loader::vtl2_config::write_kexec_trigger_time(
+                parsed,
+                state_buf.len(),
+                || self.partition.reference_time(),
+            ) {
+                tracelimit::warn_ratelimited!(CVM_ALLOWED, %correlation_id, error = %format!("{err:#}"),
+                    "failed to record kexec trigger time");
+            }
             Err(anyhow::Error::from(kexec_sys::kexec_reboot()).context("kexec reboot failed"))
         })();
         if let Err(cancel_err) = self.partition.cancel_sidecar_kexec() {

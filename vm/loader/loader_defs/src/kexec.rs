@@ -26,6 +26,11 @@ pub const COMPOSITE_ENTRY_MAGIC: u64 = u64::from_le_bytes(*b"OHCLCE01");
 pub const COMPOSITE_NOTE_TYPE: u32 = 0x4f48434c;
 /// ELF note owner, including the terminating NUL.
 pub const COMPOSITE_NOTE_NAME: &[u8] = b"OPENHCL\0";
+/// Space-padded command-line parameter the bootstrap fills with its entry and
+/// Linux-handoff reference times as `{entry:016x},{exit:016x}`.
+pub const BOOTSTRAP_TIMES_PARAM: &str = "OPENHCL_KEXEC_BOOTSTRAP_TIMES";
+/// Width of the [`BOOTSTRAP_TIMES_PARAM`] value.
+pub const BOOTSTRAP_TIMES_WIDTH: usize = 33;
 
 /// Relative component layout at the first loaded byte of a composite ELF.
 ///

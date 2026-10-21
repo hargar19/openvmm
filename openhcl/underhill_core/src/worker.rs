@@ -535,20 +535,22 @@ impl UnderhillVmWorker {
         }
 
         let settings_complete = reference_time();
+        let mut kexec_trigger_time = None;
         if kexec_servicing {
             let parsed = bootloader_fdt_parser::ParsedBootDtInfo::new()
                 .context("failed to parse device tree for persisted servicing state")?;
-            let saved_state_buf = crate::loader::vtl2_config::read_servicing_state_from_persisted(
+            let persisted = crate::loader::vtl2_config::read_servicing_state_from_persisted(
                 &parsed,
             )?
             .context("OPENHCL_KEXEC_SERVICING set but no persisted servicing state found")?;
+            kexec_trigger_time = persisted.kexec_trigger_time;
             servicing_state = Some(
-                mesh::payload::decode(&saved_state_buf)
+                mesh::payload::decode(&persisted.state)
                     .context("failed to decode persisted servicing state")?,
             );
             tracing::debug!(
                 CVM_ALLOWED,
-                saved_state_len = saved_state_buf.len(),
+                saved_state_len = persisted.state.len(),
                 "restored servicing state from persisted memory"
             );
         } else if servicing_state_from_host {
@@ -602,7 +604,11 @@ impl UnderhillVmWorker {
             } else {
                 bootloader_fdt_parser::BootTimes::new().ok()
             };
-            timeline.record_boot(kexec_servicing, boot_times, worker_entry);
+            let kexec = kexec_servicing.then(|| crate::reference_time::KexecHandoffTimes {
+                trigger: kexec_trigger_time,
+                bootstrap: servicing::kexec_bootstrap_times(),
+            });
+            timeline.record_boot(kexec, boot_times, worker_entry);
             timeline.record_optional("settings", settings_complete);
             timeline.record_optional("state_read", state_read_complete);
             timeline.record_optional("state_fixup", reference_time());
