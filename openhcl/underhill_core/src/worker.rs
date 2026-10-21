@@ -536,23 +536,34 @@ impl UnderhillVmWorker {
 
         let settings_complete = reference_time();
         let mut kexec_trigger_time = None;
+        let mut kexec_boot_dt = None;
         if kexec_servicing {
+            let dt_start = std::time::Instant::now();
             let parsed = bootloader_fdt_parser::ParsedBootDtInfo::new()
                 .context("failed to parse device tree for persisted servicing state")?;
+            let dt_parse = dt_start.elapsed();
             let persisted = crate::loader::vtl2_config::read_servicing_state_from_persisted(
                 &parsed,
             )?
             .context("OPENHCL_KEXEC_SERVICING set but no persisted servicing state found")?;
             kexec_trigger_time = persisted.kexec_trigger_time;
+            let decode_start = std::time::Instant::now();
             servicing_state = Some(
                 mesh::payload::decode(&persisted.state)
                     .context("failed to decode persisted servicing state")?,
             );
+            let decode = decode_start.elapsed();
             tracing::debug!(
                 CVM_ALLOWED,
                 saved_state_len = persisted.state.len(),
+                ?dt_parse,
+                header = ?persisted.timings.header,
+                map = ?persisted.timings.map,
+                copy = ?persisted.timings.copy,
+                ?decode,
                 "restored servicing state from persisted memory"
             );
+            kexec_boot_dt = Some(parsed);
         } else if servicing_state_from_host {
             tracing::info!(
                 CVM_ALLOWED,
@@ -582,12 +593,13 @@ impl UnderhillVmWorker {
                 .context("failed to fix up servicing state on restore")?;
         }
 
-        if kexec_servicing {
-            let parsed = bootloader_fdt_parser::ParsedBootDtInfo::new()
-                .context("failed to parse device tree to clear persisted servicing state")?;
-            crate::loader::vtl2_config::clear_servicing_state_from_persisted(&parsed)
-                .context("failed to clear persisted servicing state")?;
-        }
+        // Zeroing the stale payload waits until VTL0 runs; the header is enough
+        // to prevent restoring it again.
+        let persisted_state_to_zero = kexec_boot_dt
+            .as_ref()
+            .map(crate::loader::vtl2_config::invalidate_persisted_servicing_state)
+            .transpose()
+            .context("failed to invalidate persisted servicing state")?;
 
         let is_post_servicing = servicing_state.is_some();
         let correlation_id = (servicing_state.as_ref()).and_then(|s| s.init_state.correlation_id);
@@ -630,6 +642,7 @@ impl UnderhillVmWorker {
                 get_client: get_client.clone(),
                 dps,
                 servicing_state: servicing_init_state,
+                boot_dt: kexec_boot_dt,
                 boot_init,
                 env_cfg: params.env_cfg.clone(),
                 remote_console_cfg: params.remote_console_cfg,
@@ -647,6 +660,7 @@ impl UnderhillVmWorker {
             timeline.record("vm_build", vm.partition.reference_time());
         }
         vm.servicing_timeline = servicing_timeline;
+        vm.persisted_state_to_zero = persisted_state_to_zero;
 
         LOADED_VM.store(&vm);
 
@@ -698,6 +712,8 @@ struct UhVmParams {
     dps: DevicePlatformSettings,
     /// Provides non-recoverable configuration needed for servicing.
     servicing_state: Option<servicing::ServicingInitState>,
+    /// Boot device tree already parsed by the caller, if any.
+    boot_dt: Option<bootloader_fdt_parser::ParsedBootDtInfo>,
     /// Perform boot initialization tasks such as protecting VTL2 memory.
     boot_init: bool,
     /// Environment configuration.
@@ -1549,6 +1565,7 @@ async fn new_underhill_vm(
         mut get_client,
         mut dps,
         servicing_state,
+        boot_dt,
         boot_init,
         env_cfg,
         remote_console_cfg,
@@ -1563,8 +1580,14 @@ async fn new_underhill_vm(
     }
 
     // Read the initial configuration from the IGVM parameters.
+    let boot_dt = match boot_dt {
+        Some(parsed) => parsed,
+        None => bootloader_fdt_parser::ParsedBootDtInfo::new()
+            .context("failed to parse openhcl_boot dt")?,
+    };
     let (runtime_params, measured_vtl2_info) =
-        crate::loader::vtl2_config::read_vtl2_params().context("failed to read load parameters")?;
+        crate::loader::vtl2_config::read_vtl2_params(boot_dt)
+            .context("failed to read load parameters")?;
 
     // Log information about VTL2 memory
     let memory_allocation_mode = runtime_params.parsed_openhcl_boot().memory_allocation_mode;
@@ -3957,6 +3980,7 @@ async fn new_underhill_vm(
         state_units,
         last_state_unit_stop: (servicing_state.vm_stop_reference_time).map(ReferenceTime::new),
         servicing_timeline: None,
+        persisted_state_to_zero: None,
         partition,
         uevent_listener,
         resolver,

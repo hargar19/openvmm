@@ -168,6 +168,8 @@ pub(crate) struct LoadedVm {
     pub state_units: StateUnits,
     pub last_state_unit_stop: Option<ReferenceTime>,
     pub servicing_timeline: Option<crate::reference_time::ServicingTimeline>,
+    /// Stale kexec servicing state, zeroed once VTL0 is running again.
+    pub persisted_state_to_zero: Option<crate::loader::vtl2_config::PersistedStateToZero>,
     pub vmbus_server: Option<VmbusServerHandle>,
     // contain task handles which must be kept live
     pub host_vmbus_relay: Option<VmbusRelayHandle>,
@@ -1078,6 +1080,13 @@ impl LoadedVm {
                     .as_str(),
                 "starting VM"
             )
+        }
+
+        if let Some(state) = self.persisted_state_to_zero.take() {
+            if let Err(err) = state.zero() {
+                tracing::warn!(CVM_ALLOWED, error = %format!("{err:#}"),
+                    "failed to zero persisted servicing state");
+            }
         }
     }
 

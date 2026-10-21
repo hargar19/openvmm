@@ -147,7 +147,7 @@ after the blackout endpoint has been captured.
 | `handoff_kernel_init` (kexec only) | Flush completion through VM worker initialization entry when the predecessor recorded no reboot request time. |
 | `settings` | Read device platform settings and construct the thread pool. |
 | `state_read` | Retrieve and decode saved state from the host or persisted memory. |
-| `state_fixup` | Restore compatibility fixups, clear persisted kexec state, and prepare the timing ledger. |
+| `state_fixup` | Restore compatibility fixups, invalidate the persisted kexec state header, and prepare the timing ledger. The stale payload is zeroed after VTL0 resumes. |
 | `vm_build` | Reconstruct the VM, mappings, device managers, and channels. |
 | `restore` | Restore state units, including surrounding dispatch work. |
 | `restore_notify` | Report the restore result to the host; no host notification on kexec. |

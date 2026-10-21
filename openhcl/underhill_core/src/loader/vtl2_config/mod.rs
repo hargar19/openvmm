@@ -402,6 +402,19 @@ pub struct PersistedServicingState {
     pub state: Vec<u8>,
     /// Reference time when the predecessor requested the kexec reboot.
     pub kexec_trigger_time: Option<u64>,
+    /// Time spent reading the state, for blackout analysis.
+    pub timings: PersistedReadTimings,
+}
+
+/// Durations of the steps that read persisted servicing state.
+#[derive(Debug, Default)]
+pub struct PersistedReadTimings {
+    /// Mapping and validating the header.
+    pub header: std::time::Duration,
+    /// Mapping the servicing state region.
+    pub map: std::time::Duration,
+    /// Copying the payload and trigger time out of the region.
+    pub copy: std::time::Duration,
 }
 
 /// Read servicing state from the persisted servicing state region after a kexec
@@ -411,6 +424,8 @@ pub fn read_servicing_state_from_persisted(
 ) -> anyhow::Result<Option<PersistedServicingState>> {
     use loader_defs::shim::PersistedStateHeader;
 
+    let mut timings = PersistedReadTimings::default();
+    let start = std::time::Instant::now();
     let header_ranges = [parsed.vtl2_persisted_header];
     let header_mapping =
         Vtl2ParamsMap::new_writeable(&header_ranges).context("unable to map persisted header")?;
@@ -451,11 +466,15 @@ pub fn read_servicing_state_from_persisted(
         payload_len = header.servicing_state_payload_len,
         "reading servicing state from persisted region"
     );
+    timings.header = start.elapsed();
 
+    let start = std::time::Instant::now();
     let ranges = [region];
     let mapping = Vtl2ParamsMap::new_writeable(&ranges)
         .context("failed to map persisted servicing state region")?;
+    timings.map = start.elapsed();
 
+    let start = std::time::Instant::now();
     let mut buf = vec![0u8; header.servicing_state_payload_len as usize];
     mapping
         .read_at(0, &mut buf)
@@ -470,15 +489,43 @@ pub fn read_servicing_state_from_persisted(
     } else {
         None
     };
+    timings.copy = start.elapsed();
 
     Ok(Some(PersistedServicingState {
         state: buf,
         kexec_trigger_time,
+        timings,
     }))
 }
 
-/// Clear servicing state after it has been decoded successfully.
-pub fn clear_servicing_state_from_persisted(parsed: &ParsedBootDtInfo) -> anyhow::Result<()> {
+/// Persisted servicing state payload whose header was already invalidated.
+pub struct PersistedStateToZero {
+    region: MemoryRange,
+    len: u64,
+}
+
+impl PersistedStateToZero {
+    /// Zero the stale payload and kexec trigger record.
+    pub fn zero(self) -> anyhow::Result<()> {
+        if self.len == 0 {
+            return Ok(());
+        }
+        let ranges = [self.region];
+        Vtl2ParamsMap::new_writeable(&ranges)
+            .context("failed to map persisted servicing state region")?
+            .write_at(0, &vec![0u8; self.len as usize])
+            .context("failed to zero servicing state region")?;
+        tracing::debug!(CVM_ALLOWED, "zeroed persisted servicing state");
+        Ok(())
+    }
+}
+
+/// Invalidate the persisted state header so the servicing state cannot be
+/// restored again. Zeroing the payload is left to the caller, so it can be
+/// done outside the servicing blackout.
+pub fn invalidate_persisted_servicing_state(
+    parsed: &ParsedBootDtInfo,
+) -> anyhow::Result<PersistedStateToZero> {
     use loader_defs::shim::PersistedStateHeader;
 
     let header_ranges = [parsed.vtl2_persisted_header];
@@ -495,29 +542,29 @@ pub fn clear_servicing_state_from_persisted(parsed: &ParsedBootDtInfo) -> anyhow
         ..header
     };
     header_mapping.write_at(0, cleared_header.as_bytes())?;
+    tracing::debug!(CVM_ALLOWED, "invalidated persisted servicing state");
 
     let region = parsed.vtl2_persisted_servicing_state;
-    let ranges = [region];
-    let mapping = Vtl2ParamsMap::new_writeable(&ranges)
-        .context("failed to map persisted servicing state region")?;
-    if header.servicing_state_payload_len <= region.len() {
-        let len = kexec_trigger_range(header.servicing_state_payload_len)
+    let len = if header.servicing_state_payload_len <= region.len() {
+        kexec_trigger_range(header.servicing_state_payload_len)
             .end
-            .min(region.len());
-        mapping
-            .write_at(0, &vec![0u8; len as usize])
-            .context("failed to zero servicing state region")?;
-    }
-
-    tracing::debug!(CVM_ALLOWED, "cleared persisted servicing state");
-
-    Ok(())
+            .min(region.len())
+    } else {
+        0
+    };
+    Ok(PersistedStateToZero { region, len })
 }
 
-/// Reads the VTL 2 parameters from the config region and VTL2 reserved region.
-pub fn read_vtl2_params() -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info)> {
-    let parsed_openhcl_boot = ParsedBootDtInfo::new().context("failed to parse openhcl_boot dt")?;
+/// Clear servicing state after it has been decoded successfully.
+pub fn clear_servicing_state_from_persisted(parsed: &ParsedBootDtInfo) -> anyhow::Result<()> {
+    invalidate_persisted_servicing_state(parsed)?.zero()
+}
 
+/// Reads the VTL 2 parameters from the config region and VTL2 reserved region,
+/// using the already parsed boot device tree.
+pub fn read_vtl2_params(
+    parsed_openhcl_boot: ParsedBootDtInfo,
+) -> anyhow::Result<(RuntimeParameters, MeasuredVtl2Info)> {
     let mapping = Vtl2ParamsMap::new(&parsed_openhcl_boot.config_ranges, true)
         .context("failed to map igvm parameters")?;
 
