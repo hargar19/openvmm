@@ -251,9 +251,23 @@ fn build_kernel_command_line(
         }
     }
 
-    // Kexec servicing stages its images in KHO scratch memory.
+    // Kexec servicing loads its segments directly into a CMA area, so nothing
+    // is copied after the jump and the purgatory skips its checksum. VTL2
+    // configurations too small to spare the area use KHO scratch instead,
+    // which still skips the checksum.
     if cfg!(target_arch = "x86_64") && !params.isolation_type.is_hardware_isolated() {
-        write!(cmdline, "kho=on ")?;
+        const KEXEC_CMA_SIZE_MIB: u64 = 64;
+        const KEXEC_CMA_MIN_VTL2_RAM: u64 = 512 * 1024 * 1024;
+        let vtl2_ram: u64 = partition_info
+            .vtl2_ram
+            .iter()
+            .map(|entry| entry.range.len())
+            .sum();
+        if vtl2_ram >= KEXEC_CMA_MIN_VTL2_RAM {
+            write!(cmdline, "cma={KEXEC_CMA_SIZE_MIB}M ")?;
+        } else {
+            write!(cmdline, "kho=on ")?;
+        }
     }
 
     // Enable the com3 console by default if it's available and we're not
