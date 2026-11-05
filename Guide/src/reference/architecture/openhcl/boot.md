@@ -137,7 +137,9 @@ after the blackout endpoint has been captured.
 | `save` | Full save, including emulation platform, state units, drivers, VMBus client, and compatibility fixups. |
 | `shutdown` | Persist boot information and finish concurrent PCI, MANA, and NVMe shutdown. |
 | `flush` | Log-flush request and completion, including surrounding orchestration. |
-| `handoff` (host only) | Flush completion through the next bootloader's start checkpoint. |
+| `handoff` (host only) | Flush completion through the next bootloader's start checkpoint. Split into `state_send` and `host_restart` when the predecessor recorded the host's ack. |
+| `state_send` (host only) | Flush completion through the host's acknowledgement of the saved state: serialization and GET transfer. |
+| `host_restart` (host only) | Host acknowledgement through the next bootloader's start checkpoint: VP stop, VTL2 VMBus reset, IGVM reload, and VTL2 register reset. |
 | `bootloader` (host only) | Bootloader start through its saved end checkpoint; includes sidecar setup. |
 | `kernel_init` | Host: bootloader tail, kernel boot, init process, VMM and transport startup, through VM worker initialization entry. Kexec: the same from the bootstrap's jump to Linux. |
 | `kexec_prep` (kexec only) | Flush completion through the reboot request: serialization, state persistence, and sidecar preparation. |
@@ -191,10 +193,20 @@ checks the same digest with its accelerated SHA-256 library after device
 shutdown, and the purgatory skips its own check only after a match.
 
 For host servicing, `handoff` includes serialization and host state
-transfer/restart. Separating host processing from transfer and restart
-requires host-side timestamps. Image staging before VM stop is outside
-blackout. Kernel and early userspace are deliberately grouped to avoid
-additional instrumentation in the kernel or init process.
+transfer/restart. Right after the host acknowledges the saved state, the
+outgoing instance writes the reference time to the start of the persisted
+servicing state region. It maps that page before the VM stops, so the
+blackout pays only a 16-byte write. The incoming instance reads and clears
+the record while it reads the VTL2 parameters, then splits `handoff` into
+`state_send` and `host_restart`. It ignores a record outside the `handoff`
+interval. Separating the host's own restart steps requires host-side
+timestamps. The bootloader logs one `shim steps:` line with the duration of
+each step inside `bootloader`: `dt` (host device tree and persisted state),
+`setup`, `sidecar`, `cmdline` (command line and boot data), `initrd_crc`
+(software CRC32 of the initrd, size logged), and `boot_params`. Image
+staging before VM stop is outside blackout. Kernel and early userspace are
+deliberately grouped to avoid additional instrumentation in the kernel or
+init process.
 
 If a required timestamp is unavailable or moves backward, `phases=None`
 reports that the breakdown is unavailable instead of inventing durations.

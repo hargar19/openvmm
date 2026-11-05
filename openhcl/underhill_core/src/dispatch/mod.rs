@@ -629,6 +629,19 @@ impl LoadedVm {
 
         let running = self.state_units.is_running();
         let mut devices_shutdown = false;
+        // INSTRUMENTATION: the host restarts VTL2 right after it acks the
+        // saved state, so map the ack record before the blackout starts.
+        let host_ack = crate::loader::vtl2_config::HostAckRecorder::new(
+            self.runtime_params.parsed_openhcl_boot(),
+        )
+        .inspect_err(|err| {
+            tracing::warn!(
+                CVM_ALLOWED,
+                error = %format!("{err:#}"),
+                "failed to map host ack record"
+            );
+        })
+        .ok();
         let success = match self
             .handle_servicing_inner(
                 correlation_id,
@@ -653,6 +666,9 @@ impl LoadedVm {
                     "sending servicing state to host"
                 );
                 self.get_client.send_servicing_state(state_buf).await?;
+                if let Some(host_ack) = &host_ack {
+                    host_ack.record(self.partition.reference_time());
+                }
                 tracing::info!(
                     CVM_ALLOWED,
                     %correlation_id,

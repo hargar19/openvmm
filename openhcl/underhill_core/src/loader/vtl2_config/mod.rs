@@ -397,6 +397,71 @@ pub fn write_kexec_trigger_time(
     )
 }
 
+/// Identifies the host-servicing ack reference time (INSTRUMENTATION only).
+const HOST_ACK_MAGIC: u64 = u64::from_le_bytes(*b"OHCLHACK");
+
+/// The page holding the host ack record: the start of the persisted servicing
+/// state region, which host servicing leaves unused.
+fn host_ack_page(parsed: &ParsedBootDtInfo) -> anyhow::Result<MemoryRange> {
+    let region = parsed.vtl2_persisted_servicing_state;
+    anyhow::ensure!(
+        region.start().is_multiple_of(HV_PAGE_SIZE) && region.len() >= HV_PAGE_SIZE,
+        "no room for the host ack time"
+    );
+    Ok(MemoryRange::new(
+        region.start()..region.start() + HV_PAGE_SIZE,
+    ))
+}
+
+/// Records when the host acknowledged the saved state during host-driven
+/// servicing (INSTRUMENTATION only).
+///
+/// The `[magic, reference_time]` record lives at the start of the persisted
+/// servicing state region, which the host does not overwrite. The host
+/// restarts VTL2 right after the ack, so the record is mapped and cleared
+/// before the save, and [`Self::record`] only writes 16 bytes.
+pub struct HostAckRecorder(SparseMapping);
+
+impl HostAckRecorder {
+    pub fn new(parsed: &ParsedBootDtInfo) -> anyhow::Result<Self> {
+        let page = host_ack_page(parsed)?;
+        let mapping = SparseMapping::new(page.len() as usize)
+            .context("failed to create a sparse mapping for the host ack time")?;
+        let dev_mem = fs_err::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open("/dev/mem")?;
+        mapping
+            .map_file(0, page.len() as usize, dev_mem.file(), page.start(), true)
+            .context("failed to map the host ack time")?;
+        mapping.write_at(0, [0u64; 2].as_bytes())?;
+        Ok(Self(mapping))
+    }
+
+    /// Store `time`. The magic is written last, so a restart in between
+    /// leaves no record rather than a torn one.
+    pub fn record(&self, time: u64) {
+        let _ = self.0.write_at(8, time.as_bytes());
+        let _ = self.0.write_at(0, HOST_ACK_MAGIC.as_bytes());
+    }
+}
+
+/// Read and clear the host ack time left by a host-servicing predecessor
+/// (INSTRUMENTATION only).
+pub fn take_host_ack_time(parsed: &ParsedBootDtInfo) -> anyhow::Result<Option<u64>> {
+    let ranges = [host_ack_page(parsed)?];
+    let mapping = Vtl2ParamsMap::new_writeable(&ranges)
+        .context("failed to map persisted servicing state region")?;
+    let [magic, time]: [u64; 2] = mapping
+        .read_plain(0)
+        .context("failed to read the host ack time")?;
+    if magic != HOST_ACK_MAGIC {
+        return Ok(None);
+    }
+    mapping.write_at(0, [0u64; 2].as_bytes())?;
+    Ok(Some(time))
+}
+
 /// Servicing state left in persisted memory by a kexec predecessor.
 pub struct PersistedServicingState {
     pub state: Vec<u8>,

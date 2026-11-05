@@ -568,6 +568,22 @@ fn get_ref_time(isolation: IsolationType) -> Option<u64> {
     }
 }
 
+/// Log the duration of each step in `times`, which holds the reference time
+/// at the end of each step after the first (INSTRUMENTATION only).
+fn log_step_times(times: &[(&str, Option<u64>)], initrd_size: u64) {
+    let mut line = ArrayString::<256>::new();
+    for pair in times.windows(2) {
+        let (Some(start), (name, Some(end))) = (pair[0].1, pair[1]) else {
+            return;
+        };
+        let ticks = end.wrapping_sub(start);
+        if write!(line, " {name}={}.{}us", ticks / 10, ticks % 10).is_err() {
+            return;
+        }
+    }
+    log::info!("shim steps:{line} initrd_size={initrd_size:#x}");
+}
+
 /// Dump diagnostics when initrd CRC32 does not match the build-time value.
 ///
 /// Contents:
@@ -686,6 +702,10 @@ fn shim_main(shim_params_raw_offset: isize) -> ! {
         static_options.parse(cmdline);
     }
 
+    // INSTRUMENTATION: time each shim step between the boot_times endpoints.
+    let mut step_times = ArrayVec::<(&str, Option<u64>), 8>::new();
+    step_times.push(("start", boot_reftime));
+
     let static_confidential_debug = static_options.confidential_debug;
     let can_trust_host = p.isolation_type == IsolationType::None || static_confidential_debug;
 
@@ -710,6 +730,7 @@ fn shim_main(shim_params_raw_offset: isize) -> ! {
     boot_logger_runtime_init(p.isolation_type, partition_info.com3_serial.clone());
     log::info!("openhcl_boot: logging enabled");
     log::info!("serial configuration: {:#x?}", partition_info.com3_serial);
+    step_times.push(("dt", get_ref_time(p.isolation_type)));
 
     // Confidential debug will show up in boot_options only if included in the
     // static command line, or if can_trust_host is true (so the dynamic command
@@ -760,6 +781,7 @@ fn shim_main(shim_params_raw_offset: isize) -> ! {
     setup_vtl2_vp(partition_info);
 
     verify_imported_regions_hash(&p);
+    step_times.push(("setup", get_ref_time(p.isolation_type)));
 
     let mut sidecar_params = off_stack!(PageAlign<SidecarParams>, zeroed());
     let mut sidecar_output = off_stack!(PageAlign<SidecarOutput>, zeroed());
@@ -770,6 +792,7 @@ fn shim_main(shim_params_raw_offset: isize) -> ! {
         &mut sidecar_params.0,
         &mut sidecar_output.0,
     );
+    step_times.push(("sidecar", get_ref_time(p.isolation_type)));
 
     // Rebind address_space as no longer mutable.
     let address_space: &AddressSpaceManager = address_space;
@@ -811,6 +834,7 @@ fn shim_main(shim_params_raw_offset: isize) -> ! {
     }
 
     let initrd = p.initrd_base..p.initrd_base + p.initrd_size;
+    step_times.push(("cmdline", get_ref_time(p.isolation_type)));
 
     // Validate the initrd crc matches what was put at file generation time.
     let computed_crc = crc32fast::hash(p.initrd());
@@ -823,6 +847,7 @@ fn shim_main(shim_params_raw_offset: isize) -> ! {
         computed_crc, p.initrd_crc,
         "computed initrd crc does not match build time calculated crc"
     );
+    step_times.push(("initrd_crc", get_ref_time(p.isolation_type)));
 
     #[cfg(target_arch = "x86_64")]
     let boot_params = x86_boot::build_boot_params(
@@ -840,6 +865,8 @@ fn shim_main(shim_params_raw_offset: isize) -> ! {
         start,
         end: get_ref_time(p.isolation_type).unwrap_or(0),
     });
+    step_times.push(("boot_params", boot_times.as_ref().map(|times| times.end)));
+    log_step_times(&step_times, p.initrd_size);
 
     // Validate that no imported regions that are pending are not part of vtl2
     // ram.

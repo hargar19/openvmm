@@ -1593,6 +1593,20 @@ async fn new_underhill_vm(
         crate::loader::vtl2_config::read_vtl2_params(boot_dt)
             .context("failed to read load parameters")?;
 
+    // INSTRUMENTATION: split host-servicing `handoff` at the host's ack.
+    build_timeline.split_handoff(|| {
+        crate::loader::vtl2_config::take_host_ack_time(runtime_params.parsed_openhcl_boot())
+            .inspect_err(|err| {
+                tracing::warn!(
+                    CVM_ALLOWED,
+                    error = %format!("{err:#}"),
+                    "failed to read host ack time"
+                );
+            })
+            .ok()
+            .flatten()
+    });
+
     // Log information about VTL2 memory
     let memory_allocation_mode = runtime_params.parsed_openhcl_boot().memory_allocation_mode;
     tracing::info!(

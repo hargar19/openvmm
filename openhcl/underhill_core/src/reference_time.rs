@@ -96,6 +96,35 @@ impl ServicingTimeline {
         }
     }
 
+    /// Splits host-servicing `handoff` at `ack`, when the host acknowledged
+    /// the saved state, into `state_send` and `host_restart`
+    /// (INSTRUMENTATION only). Returns false and leaves the timeline
+    /// unchanged if `ack` is outside the handoff interval.
+    pub fn split_handoff(&mut self, ack: u64) -> bool {
+        let Some(index) = self
+            .checkpoints
+            .iter()
+            .position(|&(phase, _)| phase == "handoff")
+        else {
+            return false;
+        };
+        let Some(&(_, Some(start))) = index
+            .checked_sub(1)
+            .and_then(|prev| self.checkpoints.get(prev))
+        else {
+            return false;
+        };
+        let (_, Some(end)) = self.checkpoints[index] else {
+            return false;
+        };
+        if !(start..=end).contains(&ack) {
+            return false;
+        }
+        self.checkpoints[index].0 = "host_restart";
+        self.checkpoints.insert(index, ("state_send", Some(ack)));
+        true
+    }
+
     pub fn durations(&self) -> Option<Vec<(&'static str, Duration)>> {
         self.checkpoints
             .windows(2)
@@ -139,6 +168,23 @@ impl TimelineRecorder {
 
     pub fn into_timeline(self) -> Option<ServicingTimeline> {
         self.timeline
+    }
+
+    /// Splits host-servicing `handoff` with the time from `read_ack`, which is
+    /// only called while a host-servicing timeline is being recorded
+    /// (INSTRUMENTATION only).
+    pub fn split_handoff(&mut self, read_ack: impl FnOnce() -> Option<u64>) {
+        let Some(timeline) = &mut self.timeline else {
+            return;
+        };
+        if timeline.method != "host" {
+            return;
+        }
+        if let Some(ack) = read_ack() {
+            if !timeline.split_handoff(ack) {
+                tracing::debug!(ack, "host ack time outside handoff; not splitting");
+            }
+        }
     }
 }
 
@@ -320,5 +366,71 @@ mod tests {
         let mut recorder = TimelineRecorder::new(None, || panic!("clock read on cold boot"));
         recorder.record("vm_config");
         assert!(recorder.into_timeline().is_none());
+    }
+
+    fn host_timeline() -> ServicingTimeline {
+        let mut timeline = ServicingTimeline::default();
+        timeline.record("flush", 100);
+        timeline.record_boot(
+            None,
+            Some(bootloader_fdt_parser::BootTimes {
+                start: Some(200),
+                end: Some(300),
+                sidecar_start: None,
+                sidecar_end: None,
+            }),
+            Some(900),
+        );
+        timeline
+    }
+
+    #[test]
+    fn servicing_timeline_splits_host_handoff_at_ack() {
+        let mut timeline = host_timeline();
+        assert!(timeline.split_handoff(130));
+        assert_eq!(
+            timeline.durations().unwrap(),
+            vec![
+                ("state_send", Duration::from_nanos(3000)),
+                ("host_restart", Duration::from_nanos(7000)),
+                ("bootloader", Duration::from_nanos(10000)),
+                ("kernel_init", Duration::from_nanos(60000)),
+            ]
+        );
+    }
+
+    #[test]
+    fn servicing_timeline_ignores_ack_outside_handoff() {
+        for ack in [50, 250] {
+            let mut timeline = host_timeline();
+            assert!(!timeline.split_handoff(ack));
+            assert_eq!(timeline.durations().unwrap()[0].0, "handoff");
+        }
+    }
+
+    #[test]
+    fn timeline_recorder_reads_ack_only_for_host_servicing() {
+        let mut timeline = ServicingTimeline::default();
+        timeline.record("flush", 100);
+        timeline.record_boot(
+            Some(KexecHandoffTimes {
+                trigger: Some(110),
+                bootstrap: None,
+            }),
+            None,
+            Some(900),
+        );
+        let mut recorder = TimelineRecorder::new(Some(timeline), || None);
+        recorder.split_handoff(|| panic!("ack read after kexec"));
+
+        let mut recorder = TimelineRecorder::new(None, || None);
+        recorder.split_handoff(|| panic!("ack read on cold boot"));
+
+        let mut recorder = TimelineRecorder::new(Some(host_timeline()), || None);
+        recorder.split_handoff(|| Some(150));
+        assert_eq!(
+            recorder.into_timeline().unwrap().durations().unwrap()[0],
+            ("state_send", Duration::from_nanos(5000))
+        );
     }
 }
